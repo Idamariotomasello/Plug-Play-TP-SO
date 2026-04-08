@@ -1,0 +1,40 @@
+{
+  "folders": [
+    {
+      "name": "kernel_scheduler",
+      "path": "kernel_scheduler"
+    },
+    {
+      "name": "kernel_memory",
+      "path": "kernel_memory"
+    },
+    {
+      "name": "cpu",
+      "path": "cpu"
+    },
+    {
+      "name": "memory_stick",
+      "path": "memory_stick"
+    },
+    {
+      "name": "swap",
+      "path": "swap"
+    },
+    {
+      "name": "io",
+      "path": "io"
+    },
+    {
+      "name": "utils",
+      "path": "utils"
+    }
+  ],
+  "settings": {
+    "debug.onTaskErrors": "abort",
+    "files.associations": {
+      "*.h": "c"
+    },
+    "C_Cpp.autoAddFileAssociations": false,
+    "C_Cpp.errorSquiggles": "disabled"
+  }
+}
