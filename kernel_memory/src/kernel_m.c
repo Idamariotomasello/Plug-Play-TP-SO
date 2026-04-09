@@ -1,4 +1,6 @@
-#include <utils/hello.h>
+#include "kernel_m.h"
+#include <cliente.h>
+#include <server.h>
 
 int main(int argc, char* argv[]) {
     saludar("kernel_memory");

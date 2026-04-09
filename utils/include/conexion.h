@@ -1,7 +1,7 @@
-//wrappers de send/recv
+#ifndef CONEXION_H_
+#define CONEXION_H_
 
-#ifndef UTILS_HELLO_H_
-#define UTILS_HELLO_H_
+#include <commons/config.h>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -12,5 +12,8 @@
 * @return No devuelve nada
 */
 void saludar(char* quien);
+
+
+
 
 #endif
