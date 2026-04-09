@@ -1,3 +1,5 @@
+//wrappers de send/recv
+
 #ifndef UTILS_HELLO_H_
 #define UTILS_HELLO_H_
 
