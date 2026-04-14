@@ -14,47 +14,38 @@ endef
 
 ################################################################################
 
-# Project name
 NAME=$(shell pwd | xargs -I{} basename "{}")
 
-# Set compiler and archiver options
 CC=gcc
 AR=ar
 ARFLAGS=rcs
 MAKE=make --no-print-directory
 
-# Set prerrequisites
+# Fuentes: .c en src/, .h en src/ e include/
 SRCS_C += $(shell find src -iname "*.c")
-SRCS_H += $(shell find src -iname "*.h")
+SRCS_H += $(shell find src include -iname "*.h" 2>/dev/null)
+
 DEPS = $(foreach SHL,$(SHARED_LIBPATHS),$(SHL:%=%/lib/lib$(notdir $(SHL)).so)) \
 	$(foreach STL,$(STATIC_LIBPATHS),$(STL:%=%/lib/lib$(notdir $(STL)).a))
 
-# Set header paths to (-I)nclude
-IDIRS += $(addsuffix /src,$(SHARED_LIBPATHS) $(STATIC_LIBPATHS) .) /usr/local/include
+# Incluye tanto /src como /include de cada dependencia y del módulo actual
+IDIRS += $(addsuffix /src,$(SHARED_LIBPATHS) $(STATIC_LIBPATHS) .) \
+         $(addsuffix /include,$(SHARED_LIBPATHS) $(STATIC_LIBPATHS) .) \
+         /usr/local/include
 
-# Set library paths to (-L)ook
 LIBDIRS = $(addsuffix /lib,$(SHARED_LIBPATHS) $(STATIC_LIBPATHS)) /usr/local/lib
 
-# Set shared library paths to be found in runtime (-rpath)
 RUNDIRS = $(SHARED_LIBPATHS:%=$(shell pwd)/%/lib)
 
-# Set intermediate objects
 OBJS = $(patsubst src/%.c,obj/%.o,$(SRCS_C))
 
-# Set output
 OUT = $(call outname,$(NAME))
 
-# Set test folder
 TESTS_DIR=tests
-
-# Set test prerrequisites
-TESTS_C += $(shell find $(TESTS_DIR)/ -iname "*.c" 2> /dev/null)
-TESTS_H += $(shell find $(TESTS_DIR)/ -iname "*.h" 2> /dev/null)
-
-# Set test intermediate objects
-TEST_OBJS = $(filter-out $(TEST_EXCLUDE), $(TESTS_C)) $(patsubst src/%.c,obj/%.o,$(filter-out $(TEST_EXCLUDE), $(SRCS_C)))
-
-# Set test binary targets
+TESTS_C += $(shell find $(TESTS_DIR)/ -iname "*.c" 2>/dev/null)
+TESTS_H += $(shell find $(TESTS_DIR)/ -iname "*.h" 2>/dev/null)
+TEST_OBJS = $(filter-out $(TEST_EXCLUDE), $(TESTS_C)) \
+            $(patsubst src/%.c,obj/%.o,$(filter-out $(TEST_EXCLUDE), $(SRCS_C)))
 TEST = bin/$(NAME)_tests
 
 .PHONY: all
@@ -86,9 +77,15 @@ $(TEST): $(TEST_OBJS) $(DEPS) | $(dir $(TEST))
 obj/%.o: src/%.c $(SRCS_H) $(DEPS) | $(dir $(OBJS))
 	$(call compile_objs)
 
+# Busca fuentes en src/ e include/ de la dependencia al compilarla recursivamente
 .SECONDEXPANSION:
-$(DEPS): $$(shell find $$(patsubst %lib/,%src/,$$(dir $$@)) -iname "*.c" -or -iname "*.h")
-	$(MAKE) -C $(patsubst %lib/,%,$(dir $@)) 3>&1 1>&2 2>&3 | sed -E 's,(src/)[^ ]+\.(c|h)\:,$(patsubst %lib/,%,$(dir $@))&,' 3>&2 2>&1 1>&3
+$(DEPS): $$(shell find \
+		$$(patsubst %lib/,%src/,$$(dir $$@)) \
+		$$(patsubst %lib/,%include/,$$(dir $$@)) \
+		-iname "*.c" -or -iname "*.h" 2>/dev/null)
+	$(MAKE) -C $(patsubst %lib/,%,$(dir $@)) 3>&1 1>&2 2>&3 \
+		| sed -E 's,(src/)[^ ]+\.(c|h)\:,$(patsubst %lib/,%,$(dir $@))&,' \
+		3>&2 2>&1 1>&3
 
 $(sort $(dir $(OUT) $(OBJS))):
 	mkdir -pv $@
