@@ -88,7 +88,7 @@ void agregar_a_paquete(t_paquete* paquete, void* valor, int tamanio)
 	paquete->buffer->size += tamanio + sizeof(int);
 }
 
-void enviar_paquete(t_paquete* paquete, int socket_cliente) {
+void enviar_paquete(t_paquete* paquete, int socket_cliente,  t_log* logger) {
  
 	    // Validaciones
     if (paquete == NULL) {
@@ -137,4 +137,15 @@ void enviar_paquete(t_paquete* paquete, int socket_cliente) {
     if (logger) {
         log_info(logger, "Paquete enviado exitosamente - Cod OP: %d, Tamaño: %d bytes", paquete->codigo_operacion, paquete->buffer->size);
     }
+}
+
+
+void eliminar_paquete(t_paquete *paquete)
+{
+    if (!paquete) return;
+    if (paquete->buffer) {
+        free(paquete->buffer->stream);
+        free(paquete->buffer);
+    }
+    free(paquete);
 }

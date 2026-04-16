@@ -25,13 +25,8 @@ typedef struct
  * API del servidor KM
  * ========================================================= */
 
-/* Arranca el accept loop (bloqueante) */
 void  km_iniciar_servidor(t_log *logger, int puerto);
-
-/* Hilo despachador — determina tipo y llama al atendedor */
 void *km_despachar_cliente(void *arg);
-
-/* Hilos atendedores por tipo de cliente */
 void  km_atender_ks(t_log *logger, int fd_ks);
 void  km_atender_cpu(t_log *logger, int fd_cpu);
 void  km_atender_ms(t_log *logger, int fd_ms);

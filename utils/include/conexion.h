@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <commons/log.h>
 #include <commons/config.h>
+#include <semaphore.h>
 
 /**
 * @brief Imprime un saludo por consola
@@ -28,6 +29,9 @@ void saludar(char* quien);
 extern t_log *logger;
 extern t_config *config;
 
+extern sem_t g_sem_listo;
+
+
 typedef struct {
     t_log *logger;
     int fd_cliente;
@@ -35,34 +39,7 @@ typedef struct {
 
 
 typedef enum
-{
-    //Handshakes
-    GET_BLOCK_SIZE = 100,
-    BLOCK_SIZE = 101,
-    HANDSHAKE_WORKER = 102,
-    CONFIRMATION = 103,
-    HANDSHAKE_QUERY_CONTROL = 105,
-
-    //Operaciones Archivos
-    OP_CREATE = 200,
-    OP_READ = 201,
-    OP_WRITE = 202,
-    OP_TRUNCATE = 203,
-    OP_DELETE = 204,
-    OP_TAG = 205,
-    OP_COMMIT = 206,
-    OP_FLUSH = 207,
-    OP_END = 208,
-
-    //Respuestas
-    OP_OK = 400,
-    OP_ERROR = 401,
-
-    RESULTADO_READ = 300,
-    OP_PROGRAM_COUNTER = 301,
-    MENSAJE_LECTURA = 302,
-    ERROR_EJECUCION = 303,
-    
+{    
     //Identificadores de módulos
     MENSAJE = 10,
     PAQUETE = 11,
@@ -72,7 +49,43 @@ typedef enum
     TIPO_SWAP = 15,
     TIPO_IO = 16,
     TIPO_KM = 17,
+
+    //Handshakes
+    HANDSHAKE_KS = 100,
+    HANDSHAKE_CPU = 101,
+    HANDSHAKE_MS = 102,
+    HANDSHAKE_SWAP = 103,
+
+    //Operaciones KS->KM
+    OP_CREAR_PROCESO = 200,
+    OP_FINALIZAR_PROCESO = 201,
+    OP_SUSPENDER_PROCESO = 202,
+    OP_DESSUSPENDER_PROCESO = 203,
+    OP_LEER_DATOS = 204,
+    OP_ESCRIBIR_DATOS = 205,
+    OP_CONFIRMAR_DESALOJO = 206,
+
+
+    //Operaciones CPU->KM
+    OP_FETCH_INSTRUCCION = 300,
+    OP_GET_CONTEXTO = 301,
+    OP_SET_CONTEXTO = 302,
+    OP_CREAR_SEGMENTO = 303,
+    OP_ELIMINAR_SEGMENTO = 304,
     
+    //Operaciones KM->KS
+    OP_NUEVA_MEMORIA = 400,
+    OP_MEMORIA_CORRUPTA = 401,
+    OP_INICIAR_COMPACT = 402,
+    OP_FIN_COMPACT = 403,
+    
+    //Operaciones KM->SWAP
+    OP_SWAP_ESCRIBIR_BLOQUE = 500,
+    OP_SWAP_LEER_BLOQUE = 501,
+
+    //Respuestas
+    OP_OK = 900,
+    OP_ERROR = 901,
 
     EXIT,
     SYSCALL_ERROR,
@@ -92,5 +105,8 @@ typedef struct
 	t_buffer* buffer;
 } t_paquete;
 
+
+void inicializar_semaforos();
+void destruir_semaforos();
 
 #endif

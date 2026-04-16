@@ -11,6 +11,14 @@
  
 #define HANDSHAKE_OK   0
 #define HANDSHAKE_ERR -1
+
+
+
+typedef struct
+{
+    t_log *logger;
+    int    puerto;
+} t_servidor_arg;
  
  
 /* =========================================================

@@ -177,6 +177,7 @@ bool recibir_int32(int fd, int32_t *dest)
 }
 
 void *recibir_buffer(int fd, int32_t *size_out)
+
 {
     if (recv(fd, size_out, sizeof(int32_t), MSG_WAITALL) != sizeof(int32_t))
         return NULL;
