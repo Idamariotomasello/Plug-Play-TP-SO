@@ -83,6 +83,10 @@ typedef enum
     OP_SWAP_ESCRIBIR_BLOQUE = 500,
     OP_SWAP_LEER_BLOQUE = 501,
 
+    //Operaciones MS->KM
+    OP_LEER_MS = 600,
+    OP_ESCRIBIR_MS = 601,
+
     //Respuestas
     OP_OK = 900,
     OP_ERROR = 901,
