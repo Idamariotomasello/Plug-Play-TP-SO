@@ -1,6 +1,7 @@
 #include "kernel_m.h"
 #include <cliente.h>
 #include <server.h>
+
 /*
 int main(int argc, char* argv[]) {
     saludar("kernel_memory");
@@ -22,7 +23,7 @@ int g_swap_conectado  = 0;
  * Avanza *offset. Devuelve malloc'd o NULL si falla.
  * ========================================================= */
  
-void *km_leer_campo(void *stream, int stream_size,
+static void *km_leer_campo(void *stream, int stream_size,
                             int *offset, int *campo_size)
 {
     if (*offset + (int)sizeof(int) > stream_size)
@@ -41,14 +42,14 @@ void *km_leer_campo(void *stream, int stream_size,
     *offset += *campo_size;
     return dato;
 }
-
+ 
 /* =========================================================
  * km_recibir_cuerpo_paquete
  * Lee size(int) + stream(size bytes) después de que el
  * cod_op ya fue leído. Compatible con enviar_paquete().
  * ========================================================= */
  
-bool km_recibir_cuerpo_paquete(int fd, void **stream_out, int *size_out)
+static bool km_recibir_cuerpo_paquete(int fd, void **stream_out, int *size_out)
 {
     if (recv(fd, size_out, sizeof(int), MSG_WAITALL) != sizeof(int))
         return false;
@@ -64,8 +65,7 @@ bool km_recibir_cuerpo_paquete(int fd, void **stream_out, int *size_out)
     }
     return true;
 }
-
-
+ 
 /* =========================================================
  * km_contar_instrucciones
  * Abre el archivo de script y cuenta líneas no vacías.
@@ -155,8 +155,7 @@ static void km_procesar_crear_proceso(int fd_ks,
     /* Responder OK al KS */
     enviar_int32(fd_ks, OP_OK);
 }
-
-
+ 
 /* =========================================================
  * km_iniciar_servidor — accept loop principal
  * ========================================================= */
@@ -293,7 +292,8 @@ void km_atender_cpu(t_log *logger, int fd_cpu)
     log_info(logger, "CPU %d desconectada (fd=%d)", id_cpu, fd_cpu);
     close(fd_cpu);
 }
- 
+
+
 /* =========================================================
  * km_atender_ms
  * ========================================================= */
@@ -330,28 +330,41 @@ void km_atender_swap(t_log *logger, int fd_swap)
 {
     int32_t block_size, swap_size;
     if (!recibir_int32(fd_swap, &block_size) ||
-        !recibir_int32(fd_swap, &swap_size)) {
+        !recibir_int32(fd_swap, &swap_size))
+    {
         log_error(logger, "Error recibiendo metadatos SWAP (fd=%d)", fd_swap);
         close(fd_swap);
         return;
     }
  
+    int32_t bloques_totales = (block_size > 0) ? swap_size / block_size : 0;
+ 
     __atomic_add_fetch(&g_swap_conectado, 1, __ATOMIC_SEQ_CST);
-    log_info(logger, "## Conectado a SWAP (fd=%d) — bloque: %d bytes, total: %d bytes",
-             fd_swap, block_size, swap_size);
+    log_info(logger, "## Conectado a SWAP (fd=%d) — bloque: %d bytes, total: %d bytes, bloques disponibles: %d",
+             fd_swap, block_size, swap_size, bloques_totales);
  
     if (g_swap_conectado == 1)
         sem_post(&g_sem_listo);
  
+    /*
+     * El SWAP es pasivo: el KM inicia todos los pedidos
+     * via OP_SWAP_ESCRIBIR_BLOQUE / OP_SWAP_LEER_BLOQUE.
+     * Este recv bloqueante detecta desconexion inesperada.
+     */
     char probe;
     if (recv(fd_swap, &probe, 1, MSG_WAITALL) <= 0)
-        log_error(logger, "SWAP (fd=%d) desconectado inesperadamente", fd_swap);
+        log_error(logger, "SWAP (fd=%d) desconectado inesperadamente — "
+                  "procesos suspendidos irrecuperables", fd_swap);
  
     __atomic_sub_fetch(&g_swap_conectado, 1, __ATOMIC_SEQ_CST);
     close(fd_swap);
-} 
+}
+ 
+/* =========================================================
+ * Hilo del servidor
+ * ========================================================= */
 
-void *hilo_servidor(void *varg)
+static void *hilo_servidor(void *varg)
 {
     t_servidor_arg *arg = (t_servidor_arg *)varg;
     km_iniciar_servidor(arg->logger, arg->puerto);
