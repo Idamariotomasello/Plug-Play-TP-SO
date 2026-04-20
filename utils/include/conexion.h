@@ -29,7 +29,10 @@ void saludar(char* quien);
 extern t_log *logger;
 extern t_config *config;
 
+extern pthread_mutex_t mutex_io;
+
 extern sem_t g_sem_listo;
+
 
 
 typedef struct {
@@ -49,6 +52,10 @@ typedef enum
     TIPO_SWAP = 15,
     TIPO_IO = 16,
     TIPO_KM = 17,
+    OP_IO_SLEEP = 18,
+    OP_IO_STDIN = 29,
+    OP_IO_STDOUT = 20,
+    
 
     //Handshakes
     HANDSHAKE_KS = 100,
@@ -86,6 +93,11 @@ typedef enum
     //Operaciones MS->KM
     OP_LEER_MS = 600,
     OP_ESCRIBIR_MS = 601,
+
+    //Operaciones KS->IO
+    IO_SUBTIPO_SLEEP = 710,
+    IO_SUBTIPO_STDIN = 711,
+    IO_SUBTIPO_STDOUT = 712,
 
     //Respuestas
     OP_OK = 900,
