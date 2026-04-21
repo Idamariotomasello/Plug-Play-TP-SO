@@ -17,7 +17,6 @@ int fd_io_sleep  = -1;
 int fd_io_stdin  = -1;
 int fd_io_stdout = -1;
 
-
 /* =========================================================
  * ks_registrar_io
  * Guarda el fd del dispositivo IO según su subtipo.
@@ -285,6 +284,16 @@ void *atender_cliente_ks(void *varg)
             return NULL;
         }
         log_info(logger, "## CPU %d Conectada (fd=%d)", id_cpu, fd);
+        log_info(logger, "## (<0>) Pasa del estado READY al estado EXEC");
+ 
+        /* Enviar PID 0 a la CPU — primer proceso a ejecutar */
+        enviar_int32(fd, (int32_t)0);
+ 
+        /* Esperar devolución: pid + motivo */
+        int32_t pid_ret, motivo;
+        if (recibir_int32(fd, &pid_ret) && recibir_int32(fd, &motivo))
+            log_info(logger, "## CPU %d devolvio PID %d — motivo: %d",
+                     id_cpu, pid_ret, motivo);
  
         int32_t cod_op;
         while (recibir_int32(fd, &cod_op))
@@ -428,6 +437,7 @@ int main(int argc, char *argv[])
     eliminar_paquete(paq);
  
     log_info(logger, "## (<0>) Se crea el proceso - Estado: NEW");
+    log_info(logger, "## (<0>) Pasa del estado NEW al estado READY");
     log_info(logger, "PID 0 enviado a KM — script: %s, prioridad: %d",
              script_nombre, prio_inicial);
  

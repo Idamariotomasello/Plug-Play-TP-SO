@@ -10,20 +10,86 @@ int main(int argc, char* argv[]) {
 */
 
 t_config *g_config  = NULL;
-t_log    *g_logger  = NULL;
+t_log *g_logger = NULL;
+
+t_proceso_km g_procesos[KM_MAX_PROCESOS];
+bool g_procesos_init = false;
 
 int g_cpus_conectadas = 0;
 int g_ms_conectados   = 0;
 int g_swap_conectado  = 0;
 
+void km_init_procesos(void)
+{
+    if (g_procesos_init) return;
+    memset(g_procesos, 0, sizeof(g_procesos));
+    g_procesos_init = true;
+}
+ 
+bool km_cargar_instrucciones(int32_t pid, const char *path)
+{
+    km_init_procesos();
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+ 
+    pthread_mutex_lock(&mutex_procesos);
+ 
+    int slot = -1;
+    for (int i = 0; i < KM_MAX_PROCESOS; i++)
+        if (!g_procesos[i].activo) { slot = i; break; }
+ 
+    if (slot == -1) {
+        pthread_mutex_unlock(&mutex_procesos);
+        fclose(f);
+        return false;
+    }
+ 
+    g_procesos[slot].pid = pid;
+    g_procesos[slot].instrucciones = malloc(KM_MAX_INSTRUCCIONES * sizeof(char*));
+    g_procesos[slot].n_instrucciones = 0;
+    g_procesos[slot].activo = true;
+ 
+    char linea[256];
+    while (fgets(linea, sizeof(linea), f) &&
+           g_procesos[slot].n_instrucciones < KM_MAX_INSTRUCCIONES)
+    {
+        int len = strlen(linea);
+        while (len > 0 && (linea[len-1] == '\n' || linea[len-1] == '\r'))
+            linea[--len] = '\0';
+        if (len == 0) continue;
+        g_procesos[slot].instrucciones[g_procesos[slot].n_instrucciones++]
+            = strdup(linea);
+    }
+ 
+    pthread_mutex_unlock(&mutex_procesos);
+    fclose(f);
+    return true;
+}
+ 
+char *km_obtener_instruccion(int32_t pid, int32_t pc)
+{
+    km_init_procesos();
+    pthread_mutex_lock(&mutex_procesos);
+    char *resultado = NULL;
+    for (int i = 0; i < KM_MAX_PROCESOS; i++) {
+        if (g_procesos[i].activo && g_procesos[i].pid == pid) {
+            if (pc >= 0 && pc < g_procesos[i].n_instrucciones)
+                resultado = g_procesos[i].instrucciones[pc];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&mutex_procesos);
+    return resultado;
+}
+ 
 /* =========================================================
  * km_leer_campo
  * Extrae un campo del stream con formato:
  *   tamanio (int) | datos (tamanio bytes)
  * Avanza *offset. Devuelve malloc'd o NULL si falla.
  * ========================================================= */
- 
-static void *km_leer_campo(void *stream, int stream_size,
+
+void *km_leer_campo(void *stream, int stream_size,
                             int *offset, int *campo_size)
 {
     if (*offset + (int)sizeof(int) > stream_size)
@@ -49,7 +115,7 @@ static void *km_leer_campo(void *stream, int stream_size,
  * cod_op ya fue leído. Compatible con enviar_paquete().
  * ========================================================= */
  
-static bool km_recibir_cuerpo_paquete(int fd, void **stream_out, int *size_out)
+bool km_recibir_cuerpo_paquete(int fd, void **stream_out, int *size_out)
 {
     if (recv(fd, size_out, sizeof(int), MSG_WAITALL) != sizeof(int))
         return false;
@@ -71,7 +137,7 @@ static bool km_recibir_cuerpo_paquete(int fd, void **stream_out, int *size_out)
  * Abre el archivo de script y cuenta líneas no vacías.
  * ========================================================= */
  
-static int km_contar_instrucciones(const char *path)
+int km_contar_instrucciones(const char *path)
 {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
@@ -94,8 +160,7 @@ static int km_contar_instrucciones(const char *path)
     fclose(f);
     return count;
 }
-
-
+ 
 /* =========================================================
  * km_procesar_crear_proceso
  * Deserializa OP_CREAR_PROCESO, arma el path, cuenta
@@ -106,7 +171,7 @@ static int km_contar_instrucciones(const char *path)
  *   [2] nombre     — char[] sin '\0'
  * ========================================================= */
  
-static void km_procesar_crear_proceso(int fd_ks,
+void km_procesar_crear_proceso(int fd_ks,
                                        void *stream, int stream_size)
 {
     int offset = 0, campo_size;
@@ -151,6 +216,10 @@ static void km_procesar_crear_proceso(int fd_ks,
                     "verificar SCRIPTS_BASEPATH en kernel_m.config", pid, path);
  
     free(nombre);
+ 
+    /* Cargar instrucciones en memoria para fetch posterior */
+    if (!km_cargar_instrucciones(pid, path))
+        log_warning(g_logger, "## PID: %d - No se pudo cargar instrucciones en tabla", pid);
  
     /* Responder OK al KS */
     enviar_int32(fd_ks, OP_OK);
@@ -286,14 +355,67 @@ void km_atender_cpu(t_log *logger, int fd_cpu)
  
     int32_t cod_op;
     while (recibir_int32(fd_cpu, &cod_op))
-        log_info(logger, "CPU %d — cod_op: %d", id_cpu, cod_op);
+    {
+        switch (cod_op)
+        {
+            case OP_FETCH_INSTRUCCION: {
+                int32_t pid, pc;
+                if (!recibir_int32(fd_cpu, &pid) || !recibir_int32(fd_cpu, &pc))
+                    goto cpu_desconectada;
  
+                char *instr = km_obtener_instruccion(pid, pc);
+                if (!instr) {
+                    log_error(logger, "## PID: %d - PC=%d fuera de rango o proceso no encontrado",
+                              pid, pc);
+                    enviar_int32(fd_cpu, OP_ERROR);
+                    break;
+                }
+ 
+                int instruction_delay = config_get_int_value(g_config, "INSTRUCTION_DELAY");
+                if (instruction_delay > 0)
+                    usleep(instruction_delay * 1000);
+ 
+                log_info(logger, "## PID: %d - Obtener instruccion: %d - Instruccion: %s",
+                         pid, pc, instr);
+ 
+                int32_t tam = (int32_t)strlen(instr);
+                enviar_int32(fd_cpu, OP_OK);
+                enviar_int32(fd_cpu, tam);
+                send(fd_cpu, instr, tam, MSG_NOSIGNAL);
+                break;
+            }
+            case OP_GET_CONTEXTO: {
+                int32_t pid;
+                if (!recibir_int32(fd_cpu, &pid)) goto cpu_desconectada;
+                log_info(logger, "CPU %d — GET_CONTEXTO PID=%d", id_cpu, pid);
+                /* contexto inicial vacío */
+                uint8_t ctx_buf[44]; memset(ctx_buf, 0, sizeof(ctx_buf));
+                enviar_int32(fd_cpu, OP_OK);
+                send(fd_cpu, ctx_buf, sizeof(ctx_buf), MSG_NOSIGNAL);
+                break;
+            }
+            case OP_SET_CONTEXTO: {
+                int32_t pid;
+                if (!recibir_int32(fd_cpu, &pid)) goto cpu_desconectada;
+                uint8_t ctx_buf[44];
+                if (recv(fd_cpu, ctx_buf, sizeof(ctx_buf), MSG_WAITALL) != sizeof(ctx_buf))
+                    goto cpu_desconectada;
+                log_info(logger, "CPU %d — SET_CONTEXTO PID=%d", id_cpu, pid);
+                enviar_int32(fd_cpu, OP_OK);
+                break;
+            }
+            default:
+                log_info(logger, "CPU %d — cod_op: %d", id_cpu, cod_op);
+                break;
+        }
+    }
+ 
+cpu_desconectada:
     __atomic_sub_fetch(&g_cpus_conectadas, 1, __ATOMIC_SEQ_CST);
     log_info(logger, "CPU %d desconectada (fd=%d)", id_cpu, fd_cpu);
     close(fd_cpu);
 }
-
-
+ 
 /* =========================================================
  * km_atender_ms
  * ========================================================= */
@@ -364,7 +486,7 @@ void km_atender_swap(t_log *logger, int fd_swap)
  * Hilo del servidor
  * ========================================================= */
 
-static void *hilo_servidor(void *varg)
+void *hilo_servidor(void *varg)
 {
     t_servidor_arg *arg = (t_servidor_arg *)varg;
     km_iniciar_servidor(arg->logger, arg->puerto);

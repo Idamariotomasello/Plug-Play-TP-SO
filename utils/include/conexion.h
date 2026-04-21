@@ -16,6 +16,7 @@
 #include <commons/log.h>
 #include <commons/config.h>
 #include <semaphore.h>
+#include <math.h>
 
 /**
 * @brief Imprime un saludo por consola
@@ -30,6 +31,7 @@ extern t_log *logger;
 extern t_config *config;
 
 extern pthread_mutex_t mutex_io;
+extern pthread_mutex_t mutex_procesos;
 
 extern sem_t g_sem_listo;
 

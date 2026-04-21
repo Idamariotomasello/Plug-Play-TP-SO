@@ -14,6 +14,7 @@ int32_t g_tamanio    = 0;      /* tamaño en bytes */
 int     g_memory_delay = 0;   /* MEMORY_DELAY en ms */
 int     fd_km         = -1;   /* socket hacia Kernel Memory */
  
+
 /* =========================================================
  * ms_leer
  * Lee g_memory_delay ms, luego copia 'tamanio' bytes
@@ -77,7 +78,27 @@ void *ms_atender_cpu(void *varg)
     int         fd_cpu = arg->fd_cliente;
     free(arg);
  
-    log_info(logger, "## CPU Conectada (fd=%d)", fd_cpu);
+    /*
+     * La CPU hace enviar_handshake(TIPO_CPU) antes de enviar su ID.
+     * recibir_handshake hace recv(tipo) + send(OK) en un paso.
+     */
+    int32_t tipo = recibir_handshake(logger, fd_cpu);
+    if (tipo == HANDSHAKE_ERR)
+    {
+        close(fd_cpu);
+        return NULL;
+    }
+ 
+    /* Recibir ID de CPU enviado post-handshake */
+    int32_t id_cpu;
+    if (!recibir_int32(fd_cpu, &id_cpu))
+    {
+        log_error(logger, "Error recibiendo ID de CPU (fd=%d)", fd_cpu);
+        close(fd_cpu);
+        return NULL;
+    }
+ 
+    log_info(logger, "## CPU %d Conectada (fd=%d)", id_cpu, fd_cpu);
  
     int32_t cod_op;
     while (recibir_int32(fd_cpu, &cod_op))
@@ -146,7 +167,7 @@ void *ms_atender_cpu(void *varg)
     }
  
 desconectar:
-    log_info(logger, "CPU desconectada (fd=%d)", fd_cpu);
+    log_info(logger, "CPU %d desconectada (fd=%d)", id_cpu, fd_cpu);
     close(fd_cpu);
     return NULL;
 }
@@ -189,7 +210,6 @@ void ms_iniciar_servidor_cpus(int puerto)
  
     close(fd_escucha);
 }
- 
  
 void *hilo_servidor_cpus(void *varg)
 {
