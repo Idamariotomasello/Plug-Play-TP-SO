@@ -7,12 +7,17 @@ t_log *logger   = NULL;
 t_config *config   = NULL;
 int32_t g_id_cpu = -1;
  
-int fd_ks = -1;
-int fd_km = -1;
-int fd_ms = -1;
+int fd_kernel_scheduler_dispatch = -1;
+int fd_kernel_scheduler_interrupt = -1;
+int fd_kernel_memory = -1;
+int fd_memory_stick = -1;
  
-t_interrupcion  g_irq = { .activa = false, .motivo = 0 };
-pthread_mutex_t mutex_irq = PTHREAD_MUTEX_INITIALIZER;
+t_interrupcion interrupcion_pendiente = { .activa = false, .motivo = 0 };
+pthread_mutex_t mutex_interrupcion_pendiente = PTHREAD_MUTEX_INITIALIZER;
+
+static bool modo_test_sin_memoria = true;
+static bool usar_doble_conexion_kernel_scheduler = false;
+static bool enviar_syscall_extendida = false;
  
 /* =========================================================
  * Helpers de registros
@@ -61,23 +66,23 @@ char *cpu_fetch(int32_t pid, uint32_t pc)
 {
     log_info(logger, "## PID: %d - FETCH - Program Counter: %d", pid, pc);
  
-    enviar_int32(fd_km, OP_FETCH_INSTRUCCION);
-    enviar_int32(fd_km, pid);
-    enviar_int32(fd_km, (int32_t)pc);
+    enviar_int32(fd_kernel_memory, OP_FETCH_INSTRUCCION);
+    enviar_int32(fd_kernel_memory, pid);
+    enviar_int32(fd_kernel_memory, (int32_t)pc);
  
     int32_t resp;
-    if (!recibir_int32(fd_km, &resp) || resp != OP_OK)
+    if (!recibir_int32(fd_kernel_memory, &resp) || resp != OP_OK)
     {
         log_error(logger, "FETCH: KM respondio error (PID=%d, PC=%d)", pid, pc);
         return NULL;
     }
  
     int32_t tam;
-    if (!recibir_int32(fd_km, &tam) || tam <= 0)
+    if (!recibir_int32(fd_kernel_memory, &tam) || tam <= 0)
         return NULL;
  
     char *instruccion = malloc(tam + 1);
-    if (recv(fd_km, instruccion, tam, MSG_WAITALL) != tam)
+    if (recv(fd_kernel_memory, instruccion, tam, MSG_WAITALL) != tam)
     {
         free(instruccion);
         return NULL;
@@ -114,19 +119,19 @@ bool cpu_leer_memoria(int32_t pid, uint32_t dir_logica,
     log_info(logger, "PID: %d - Acción: LEER - Dirección Física: %d",
              pid, dir_fisica);
  
-    enviar_int32(fd_ms, OP_LEER_MS);
-    enviar_int32(fd_ms, dir_fisica);
-    enviar_int32(fd_ms, tamanio);
+    enviar_int32(fd_memory_stick, OP_LEER_MS);
+    enviar_int32(fd_memory_stick, dir_fisica);
+    enviar_int32(fd_memory_stick, tamanio);
  
     int32_t resp;
-    if (!recibir_int32(fd_ms, &resp) || resp != OP_OK)
+    if (!recibir_int32(fd_memory_stick, &resp) || resp != OP_OK)
         return false;
  
     int32_t tam_recv;
-    if (!recibir_int32(fd_ms, &tam_recv))
+    if (!recibir_int32(fd_memory_stick, &tam_recv))
         return false;
  
-    return recv(fd_ms, dest, tam_recv, MSG_WAITALL) == tam_recv;
+    return recv(fd_memory_stick, dest, tam_recv, MSG_WAITALL) == tam_recv;
 }
  
 bool cpu_escribir_memoria(int32_t pid, uint32_t dir_logica,
@@ -139,13 +144,109 @@ bool cpu_escribir_memoria(int32_t pid, uint32_t dir_logica,
     log_info(logger, "PID: %d - Acción: ESCRIBIR - Dirección Física: %d",
              pid, dir_fisica);
  
-    enviar_int32(fd_ms, OP_ESCRIBIR_MS);
-    enviar_int32(fd_ms, dir_fisica);
-    enviar_int32(fd_ms, tamanio);
-    send(fd_ms, src, tamanio, MSG_NOSIGNAL);
+    enviar_int32(fd_memory_stick, OP_ESCRIBIR_MS);
+    enviar_int32(fd_memory_stick, dir_fisica);
+    enviar_int32(fd_memory_stick, tamanio);
+    send(fd_memory_stick, src, tamanio, MSG_NOSIGNAL);
  
     int32_t resp;
-    return recibir_int32(fd_ms, &resp) && resp == OP_OK;
+    return recibir_int32(fd_memory_stick, &resp) && resp == OP_OK;
+}
+
+void cpu_limpiar_syscall(t_syscall_pendiente *syscall)
+{
+    if (!syscall)
+        return;
+
+    memset(syscall, 0, sizeof(t_syscall_pendiente));
+    syscall->tipo = SYSCALL_NINGUNA;
+}
+
+static void cpu_cargar_syscall(t_syscall_pendiente *syscall,
+                               e_tipo_syscall tipo,
+                               const char *nombre,
+                               const char *parametro_1,
+                               const char *parametro_2,
+                               uint32_t valor_1,
+                               uint32_t valor_2)
+{
+    if (!syscall)
+        return;
+
+    cpu_limpiar_syscall(syscall);
+    syscall->tipo = tipo;
+    snprintf(syscall->nombre, sizeof(syscall->nombre), "%s", nombre ? nombre : "");
+    snprintf(syscall->parametro_1, sizeof(syscall->parametro_1), "%s", parametro_1 ? parametro_1 : "");
+    snprintf(syscall->parametro_2, sizeof(syscall->parametro_2), "%s", parametro_2 ? parametro_2 : "");
+    syscall->valor_1 = valor_1;
+    syscall->valor_2 = valor_2;
+}
+
+static void cpu_avanzar_pc_si_corresponde(t_contexto *ctx, bool modifico_pc)
+{
+    if (!modifico_pc)
+        ctx->regs.PC++;
+}
+
+static bool cpu_enviar_string(int fd, const char *texto)
+{
+    int32_t largo = texto ? (int32_t)strlen(texto) : 0;
+    enviar_int32(fd, largo);
+
+    if (largo <= 0)
+        return true;
+
+    return send(fd, texto, largo, MSG_NOSIGNAL) == largo;
+}
+
+bool cpu_conectar_kernel_scheduler(const char *ip, int puerto)
+{
+    log_info(logger, "Conectando a Kernel Scheduler %s:%d...", ip, puerto);
+    fd_kernel_scheduler_dispatch = conectar_a_servidor(logger, ip, puerto);
+    if (fd_kernel_scheduler_dispatch == -1)
+        return false;
+
+    if (!enviar_handshake(logger, fd_kernel_scheduler_dispatch, TIPO_CPU))
+        return false;
+
+    enviar_int32(fd_kernel_scheduler_dispatch, g_id_cpu);
+
+    if (usar_doble_conexion_kernel_scheduler) {
+        enviar_int32(fd_kernel_scheduler_dispatch, CANAL_CPU_DISPATCH);
+
+        fd_kernel_scheduler_interrupt = conectar_a_servidor(logger, ip, puerto);
+        if (fd_kernel_scheduler_interrupt == -1)
+            return false;
+
+        if (!enviar_handshake(logger, fd_kernel_scheduler_interrupt, TIPO_CPU))
+            return false;
+
+        enviar_int32(fd_kernel_scheduler_interrupt, g_id_cpu);
+        enviar_int32(fd_kernel_scheduler_interrupt, CANAL_CPU_INTERRUPT);
+    }
+
+    return true;
+}
+
+bool cpu_enviar_retorno_kernel_scheduler(int32_t pid, e_motivo_retorno motivo, const t_syscall_pendiente *syscall)
+{
+    enviar_int32(fd_kernel_scheduler_dispatch, pid);
+    enviar_int32(fd_kernel_scheduler_dispatch, (int32_t)motivo);
+
+    if (motivo != MOTIVO_SYSCALL || !enviar_syscall_extendida || syscall == NULL)
+        return true;
+
+    enviar_int32(fd_kernel_scheduler_dispatch, (int32_t)syscall->tipo);
+    if (!cpu_enviar_string(fd_kernel_scheduler_dispatch, syscall->nombre))
+        return false;
+    if (!cpu_enviar_string(fd_kernel_scheduler_dispatch, syscall->parametro_1))
+        return false;
+    if (!cpu_enviar_string(fd_kernel_scheduler_dispatch, syscall->parametro_2))
+        return false;
+    enviar_int32(fd_kernel_scheduler_dispatch, (int32_t)syscall->valor_1);
+    enviar_int32(fd_kernel_scheduler_dispatch, (int32_t)syscall->valor_2);
+
+    return true;
 }
  
 /* =========================================================
@@ -156,12 +257,13 @@ bool cpu_escribir_memoria(int32_t pid, uint32_t dir_logica,
  * ========================================================= */
  
 bool cpu_execute(t_contexto *ctx, const char *linea,
-                         e_motivo_retorno *motivo)
+                         e_motivo_retorno *motivo, t_syscall_pendiente *syscall)
 {
     char op[32], a1[32], a2[32];
     op[0] = a1[0] = a2[0] = '\0';
     int campos = sscanf(linea, "%31s %31s %31s", op, a1, a2);
     bool modifico_pc = false;
+    cpu_limpiar_syscall(syscall);
  
     log_info(logger, "## PID: %d - Ejecutando: %s%s%s%s%s",
              ctx->pid, op,
@@ -197,34 +299,100 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
     /* ── Instrucciones de memoria ── */
     else if (!strcmp(op, "MOV_IN")) {
         uint32_t buf = 0;
-        cpu_leer_memoria(ctx->pid, ctx->regs.SI, sizeof(uint32_t), &buf);
+        if (modo_test_sin_memoria) {
+            log_info(logger, "PID: %d - MOV_IN en modo test sin memoria; se usa valor 0", ctx->pid);
+        } else {
+            /* Codigo real para entrega con memoria completa. */
+            cpu_leer_memoria(ctx->pid, ctx->regs.SI, sizeof(uint32_t), &buf);
+        }
         cpu_escribir_registro(&ctx->regs, a1, buf);
         log_info(logger, "PID: %d - Acción: LEER - Dirección Física: %d - Valor: %u",
                  ctx->pid, ctx->regs.SI, buf);
     }
     else if (!strcmp(op, "MOV_OUT")) {
         uint32_t val = cpu_leer_registro(&ctx->regs, a1);
-        cpu_escribir_memoria(ctx->pid, ctx->regs.DI, sizeof(uint32_t), &val);
+        if (modo_test_sin_memoria) {
+            log_info(logger, "PID: %d - MOV_OUT en modo test sin memoria; no se escribe Memory Stick", ctx->pid);
+        } else {
+            /* Codigo real para entrega con memoria completa. */
+            cpu_escribir_memoria(ctx->pid, ctx->regs.DI, sizeof(uint32_t), &val);
+        }
         log_info(logger, "PID: %d - Acción: ESCRIBIR - Dirección Física: %d - Valor: %u",
                  ctx->pid, ctx->regs.DI, val);
     }
     else if (!strcmp(op, "COPY_MEM")) {
         int32_t tam = (int32_t)cpu_leer_registro(&ctx->regs, a1);
-        void *buf = malloc(tam);
-        cpu_leer_memoria(ctx->pid, ctx->regs.SI, tam, buf);
-        cpu_escribir_memoria(ctx->pid, ctx->regs.DI, tam, buf);
-        free(buf);
+        if (modo_test_sin_memoria) {
+            log_info(logger, "PID: %d - COPY_MEM en modo test sin memoria; tamanio: %d", ctx->pid, tam);
+        } else {
+            /* Codigo real para entrega con memoria completa. */
+            void *buf = malloc(tam);
+            cpu_leer_memoria(ctx->pid, ctx->regs.SI, tam, buf);
+            cpu_escribir_memoria(ctx->pid, ctx->regs.DI, tam, buf);
+            free(buf);
+        }
     }
     /* ── Syscalls — devuelven proceso al KS ── */
     else if (!strcmp(op, "EXIT")) {
         *motivo = MOTIVO_EXIT;
         return false;
     }
-    else if (!strcmp(op, "SLEEP") || !strcmp(op, "STDIN") ||
-             !strcmp(op, "STDOUT") || !strcmp(op, "MUTEX_CREATE") ||
-             !strcmp(op, "MUTEX_LOCK") || !strcmp(op, "MUTEX_UNLOCK") ||
-             !strcmp(op, "MEM_ALLOC") || !strcmp(op, "MEM_FREE") ||
-             !strcmp(op, "INIT_PROC")) {
+    else if (!strcmp(op, "SLEEP")) {
+        cpu_cargar_syscall(syscall, SYSCALL_SLEEP, op, a1, "", (uint32_t)atoi(a1), 0);
+        cpu_avanzar_pc_si_corresponde(ctx, modifico_pc);
+        *motivo = MOTIVO_SYSCALL;
+        return false;
+    }
+    else if (!strcmp(op, "STDIN")) {
+        cpu_cargar_syscall(syscall, SYSCALL_STDIN, op, a1, a2,
+                           cpu_leer_registro(&ctx->regs, a1),
+                           cpu_leer_registro(&ctx->regs, a2));
+        cpu_avanzar_pc_si_corresponde(ctx, modifico_pc);
+        *motivo = MOTIVO_SYSCALL;
+        return false;
+    }
+    else if (!strcmp(op, "STDOUT")) {
+        cpu_cargar_syscall(syscall, SYSCALL_STDOUT, op, a1, a2,
+                           cpu_leer_registro(&ctx->regs, a1),
+                           cpu_leer_registro(&ctx->regs, a2));
+        cpu_avanzar_pc_si_corresponde(ctx, modifico_pc);
+        *motivo = MOTIVO_SYSCALL;
+        return false;
+    }
+    else if (!strcmp(op, "MUTEX_CREATE")) {
+        cpu_cargar_syscall(syscall, SYSCALL_MUTEX_CREATE, op, a1, "", 0, 0);
+        cpu_avanzar_pc_si_corresponde(ctx, modifico_pc);
+        *motivo = MOTIVO_SYSCALL;
+        return false;
+    }
+    else if (!strcmp(op, "MUTEX_LOCK")) {
+        cpu_cargar_syscall(syscall, SYSCALL_MUTEX_LOCK, op, a1, "", 0, 0);
+        cpu_avanzar_pc_si_corresponde(ctx, modifico_pc);
+        *motivo = MOTIVO_SYSCALL;
+        return false;
+    }
+    else if (!strcmp(op, "MUTEX_UNLOCK")) {
+        cpu_cargar_syscall(syscall, SYSCALL_MUTEX_UNLOCK, op, a1, "", 0, 0);
+        cpu_avanzar_pc_si_corresponde(ctx, modifico_pc);
+        *motivo = MOTIVO_SYSCALL;
+        return false;
+    }
+    else if (!strcmp(op, "MEM_ALLOC")) {
+        cpu_cargar_syscall(syscall, SYSCALL_MEM_ALLOC, op, a1, a2,
+                           (uint32_t)atoi(a1), (uint32_t)atoi(a2));
+        cpu_avanzar_pc_si_corresponde(ctx, modifico_pc);
+        *motivo = MOTIVO_SYSCALL;
+        return false;
+    }
+    else if (!strcmp(op, "MEM_FREE")) {
+        cpu_cargar_syscall(syscall, SYSCALL_MEM_FREE, op, a1, "", (uint32_t)atoi(a1), 0);
+        cpu_avanzar_pc_si_corresponde(ctx, modifico_pc);
+        *motivo = MOTIVO_SYSCALL;
+        return false;
+    }
+    else if (!strcmp(op, "INIT_PROC")) {
+        cpu_cargar_syscall(syscall, SYSCALL_INIT_PROC, op, a1, a2, 0, (uint32_t)atoi(a2));
+        cpu_avanzar_pc_si_corresponde(ctx, modifico_pc);
         *motivo = MOTIVO_SYSCALL;
         return false;
     }
@@ -232,29 +400,32 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
         log_warning(logger, "PID: %d - Instrucción desconocida: %s", ctx->pid, op);
     }
  
-    if (!modifico_pc)
-        ctx->regs.PC++;
+    cpu_avanzar_pc_si_corresponde(ctx, modifico_pc);
  
     return true;
 }
  
 /* =========================================================
  * hilo_interrupciones
- * Escucha interrupciones asíncronas del KS sobre fd_ks.
- * Las almacena en g_irq protegido por mutex_irq.
+ * Escucha interrupciones asíncronas del KS sobre fd_kernel_scheduler_interrupt.
+ * Las almacena en interrupcion_pendiente protegido por mutex_interrupcion_pendiente.
  * ========================================================= */
  
 void *hilo_interrupciones(void *arg)
 {
     (void)arg;
     int32_t motivo;
-    while (recibir_int32(fd_ks, &motivo))
+    int fd_interrupciones = usar_doble_conexion_kernel_scheduler
+        ? fd_kernel_scheduler_interrupt
+        : fd_kernel_scheduler_dispatch;
+
+    while (recibir_int32(fd_interrupciones, &motivo))
     {
         log_info(logger, "## Interrupción recibida");
-        pthread_mutex_lock(&mutex_irq);
-        g_irq.activa = true;
-        g_irq.motivo = motivo;
-        pthread_mutex_unlock(&mutex_irq);
+        pthread_mutex_lock(&mutex_interrupcion_pendiente);
+        interrupcion_pendiente.activa = true;
+        interrupcion_pendiente.motivo = motivo;
+        pthread_mutex_unlock(&mutex_interrupcion_pendiente);
     }
     return NULL;
 }
@@ -268,6 +439,8 @@ void *hilo_interrupciones(void *arg)
 void cpu_ciclo_instruccion(t_contexto *ctx)
 {
     e_motivo_retorno motivo = MOTIVO_EXIT;
+    t_syscall_pendiente syscall;
+    cpu_limpiar_syscall(&syscall);
  
     while (1)
     {
@@ -281,41 +454,55 @@ void cpu_ciclo_instruccion(t_contexto *ctx)
         }
  
         /* ── EXECUTE ── */
-        bool continuar = cpu_execute(ctx, instruccion, &motivo);
+        bool continuar = cpu_execute(ctx, instruccion, &motivo, &syscall);
         free(instruccion);
  
         if (!continuar)
             break;
  
         /* ── CHECK INTERRUPT ── */
-        pthread_mutex_lock(&mutex_irq);
-        bool hay_irq = g_irq.activa;
-        int32_t irq_motivo = g_irq.motivo;
-        pthread_mutex_unlock(&mutex_irq);
+        pthread_mutex_lock(&mutex_interrupcion_pendiente);
+        bool hay_irq = interrupcion_pendiente.activa;
+        int32_t irq_motivo = interrupcion_pendiente.motivo;
+        pthread_mutex_unlock(&mutex_interrupcion_pendiente);
  
         if (hay_irq)
         {
             log_info(logger, "## Interrupción recibida");
             motivo = (e_motivo_retorno)irq_motivo;
  
-            pthread_mutex_lock(&mutex_irq);
-            g_irq.activa = false;
-            pthread_mutex_unlock(&mutex_irq);
+            pthread_mutex_lock(&mutex_interrupcion_pendiente);
+            interrupcion_pendiente.activa = false;
+            pthread_mutex_unlock(&mutex_interrupcion_pendiente);
             break;
         }
     }
  
     /* ── Guardar contexto en KM y devolver PID al KS ── */
-    enviar_int32(fd_km, OP_SET_CONTEXTO);
-    enviar_int32(fd_km, ctx->pid);
-    send(fd_km, &ctx->regs, sizeof(t_registros), MSG_NOSIGNAL);
+    enviar_int32(fd_kernel_memory, OP_SET_CONTEXTO);
+    enviar_int32(fd_kernel_memory, ctx->pid);
+    send(fd_kernel_memory, &ctx->regs, sizeof(t_registros), MSG_NOSIGNAL);
  
     int32_t ack;
-    recibir_int32(fd_km, &ack);
+    recibir_int32(fd_kernel_memory, &ack);
  
     /* Devolver PID al KS con motivo */
-    enviar_int32(fd_ks, ctx->pid);
-    enviar_int32(fd_ks, (int32_t)motivo);
+    cpu_enviar_retorno_kernel_scheduler(ctx->pid, motivo, &syscall);
+
+    if (motivo == MOTIVO_SYSCALL) {
+        log_info(logger, "## PID: %d - Syscall pendiente: %s - %s %s - valores: %u %u",
+                 ctx->pid,
+                 syscall.nombre,
+                 syscall.parametro_1,
+                 syscall.parametro_2,
+                 syscall.valor_1,
+                 syscall.valor_2);
+        /*
+         * TODO entrega 2 integrada con Kernel Scheduler:
+         * Si ENVIAR_SYSCALL_EXTENDIDA=1, tambien se serializa por el socket
+         * de dispatch para que Kernel Scheduler pueda resolver la syscall.
+         */
+    }
  
     log_info(logger, "## PID: %d devuelto al KS — motivo: %d", ctx->pid, motivo);
 }
@@ -360,36 +547,44 @@ int main(int argc, char *argv[])
      * pero se puede agregar al config de la CPU si se necesita */
     if (config_has_property(config, "SEGMENT_MAX_SIZE"))
         g_segment_max_size = config_get_int_value(config, "SEGMENT_MAX_SIZE");
+
+    if (config_has_property(config, "MODO_TEST_SIN_MEMORIA"))
+        modo_test_sin_memoria = config_get_int_value(config, "MODO_TEST_SIN_MEMORIA") != 0;
+    if (config_has_property(config, "USAR_DOBLE_CONEXION_KS"))
+        usar_doble_conexion_kernel_scheduler = config_get_int_value(config, "USAR_DOBLE_CONEXION_KS") != 0;
+    if (config_has_property(config, "ENVIAR_SYSCALL_EXTENDIDA"))
+        enviar_syscall_extendida = config_get_int_value(config, "ENVIAR_SYSCALL_EXTENDIDA") != 0;
+    if (enviar_syscall_extendida)
+        log_info(logger, "CPU con protocolo extendido de syscall habilitado");
  
     /* ── 1. Conectar a Kernel Scheduler ── */
     char *ip_ks     = config_get_string_value(config, "IP_KERNEL_SCHEDULER");
     int   puerto_ks = config_get_int_value(config, "PUERTO_KERNEL_SCHEDULER");
  
-    log_info(logger, "Conectando a Kernel Scheduler %s:%d...", ip_ks, puerto_ks);
-    fd_ks = conectar_a_servidor(logger, ip_ks, puerto_ks);
-    free(ip_ks);
-    if (fd_ks == -1) { log_error(logger, "Fallo conexion KS"); goto cleanup; }
- 
-    if (!enviar_handshake(logger, fd_ks, TIPO_CPU))
-    { log_error(logger, "Handshake fallo con KS"); goto cleanup; }
- 
-    /* Enviar ID de CPU al KS */
-    enviar_int32(fd_ks, g_id_cpu);
+    if (!cpu_conectar_kernel_scheduler(ip_ks, puerto_ks))
+    {
+        free(ip_ks);
+        log_error(logger, "Fallo conexion/protocolo con KS");
+        goto cleanup;
+    }
     log_info(logger, "## CPU %d conectada al Kernel Scheduler", g_id_cpu);
+    if (usar_doble_conexion_kernel_scheduler)
+        log_info(logger, "## CPU %d conectada al canal de interrupciones del Kernel Scheduler", g_id_cpu);
+    free(ip_ks);
  
     /* ── 2. Conectar a Kernel Memory ── */
     char *ip_km     = config_get_string_value(config, "IP_KERNEL_MEMORY");
     int   puerto_km = config_get_int_value(config, "PUERTO_KERNEL_MEMORY");
  
     log_info(logger, "Conectando a Kernel Memory %s:%d...", ip_km, puerto_km);
-    fd_km = conectar_a_servidor(logger, ip_km, puerto_km);
+    fd_kernel_memory = conectar_a_servidor(logger, ip_km, puerto_km);
     free(ip_km);
-    if (fd_km == -1) { log_error(logger, "Fallo conexion KM"); goto cleanup; }
+    if (fd_kernel_memory == -1) { log_error(logger, "Fallo conexion KM"); goto cleanup; }
  
-    if (!enviar_handshake(logger, fd_km, TIPO_CPU))
+    if (!enviar_handshake(logger, fd_kernel_memory, TIPO_CPU))
     { log_error(logger, "Handshake fallo con KM"); goto cleanup; }
  
-    enviar_int32(fd_km, g_id_cpu);
+    enviar_int32(fd_kernel_memory, g_id_cpu);
     log_info(logger, "## CPU %d conectada al Kernel Memory", g_id_cpu);
  
     /* ── 3. Conectar a Memory Stick ── */
@@ -397,9 +592,9 @@ int main(int argc, char *argv[])
     int   puerto_ms = config_get_int_value(config, "PUERTO_MEMORY_STICK");
  
     log_info(logger, "Conectando a Memory Stick %s:%d...", ip_ms, puerto_ms);
-    fd_ms = conectar_a_servidor(logger, ip_ms, puerto_ms);
+    fd_memory_stick = conectar_a_servidor(logger, ip_ms, puerto_ms);
     free(ip_ms);
-    if (fd_ms == -1)
+    if (fd_memory_stick == -1)
     {
         log_warning(logger, "No se pudo conectar al Memory Stick — operaciones de memoria no disponibles");
         /* No es fatal en checkpoint 1 */
@@ -407,39 +602,45 @@ int main(int argc, char *argv[])
     else
         log_info(logger, "## CPU %d conectada al Memory Stick", g_id_cpu);
  
-    /*
-     * El hilo de interrupciones se implementará con un fd dedicado
-     * cuando el KS envíe interrupciones por un canal separado.
-     * Por ahora el check_interrupt solo verifica la variable g_irq
-     * que será seteada por señales en el futuro.
-     * NO lanzar el hilo aquí porque comparte fd_ks con el loop
-     * principal y causaría race condition al leer el PID.
-     */
+    pthread_t hilo_kernel_scheduler_interrupt;
+    if (usar_doble_conexion_kernel_scheduler)
+    {
+        if (pthread_create(&hilo_kernel_scheduler_interrupt, NULL, hilo_interrupciones, NULL) != 0)
+        {
+            log_error(logger, "No se pudo crear el hilo de interrupciones");
+            goto cleanup;
+        }
+        pthread_detach(hilo_kernel_scheduler_interrupt);
+    }
+    else
+    {
+        log_warning(logger, "CPU iniciada sin canal separado de interrupciones");
+    }
  
     log_info(logger, "CPU %d lista — esperando PID del Kernel Scheduler", g_id_cpu);
  
     /* ── 5. Loop principal: esperar PID, ejecutar, devolver ── */
     int32_t pid;
-    while (recibir_int32(fd_ks, &pid))
+    while (recibir_int32(fd_kernel_scheduler_dispatch, &pid))
     {
         log_info(logger, "## CPU %d recibio PID %d — solicitando contexto", g_id_cpu, pid);
  
         /* Pedir contexto al KM */
-        enviar_int32(fd_km, OP_GET_CONTEXTO);
-        enviar_int32(fd_km, pid);
+        enviar_int32(fd_kernel_memory, OP_GET_CONTEXTO);
+        enviar_int32(fd_kernel_memory, pid);
  
         int32_t resp;
-        if (!recibir_int32(fd_km, &resp) || resp != OP_OK)
+        if (!recibir_int32(fd_kernel_memory, &resp) || resp != OP_OK)
         {
             log_error(logger, "No se pudo obtener contexto de PID %d", pid);
-            enviar_int32(fd_ks, pid);
-            enviar_int32(fd_ks, (int32_t)MOTIVO_SEG_FAULT);
+            enviar_int32(fd_kernel_scheduler_dispatch, pid);
+            enviar_int32(fd_kernel_scheduler_dispatch, (int32_t)MOTIVO_SEG_FAULT);
             continue;
         }
  
         t_contexto ctx;
         ctx.pid = pid;
-        if (recv(fd_km, &ctx.regs, sizeof(t_registros), MSG_WAITALL)
+        if (recv(fd_kernel_memory, &ctx.regs, sizeof(t_registros), MSG_WAITALL)
             != sizeof(t_registros))
         {
             log_error(logger, "Error recibiendo contexto de PID %d", pid);
@@ -455,9 +656,10 @@ int main(int argc, char *argv[])
     log_info(logger, "CPU %d — KS desconectado, finalizando", g_id_cpu);
  
 cleanup:
-    if (fd_ks > 0) close(fd_ks);
-    if (fd_km > 0) close(fd_km);
-    if (fd_ms > 0) close(fd_ms);
+    if (fd_kernel_scheduler_dispatch > 0) close(fd_kernel_scheduler_dispatch);
+    if (fd_kernel_scheduler_interrupt > 0) close(fd_kernel_scheduler_interrupt);
+    if (fd_kernel_memory > 0) close(fd_kernel_memory);
+    if (fd_memory_stick > 0) close(fd_memory_stick);
     config_destroy(config);
     log_destroy(logger);
     return 0;
