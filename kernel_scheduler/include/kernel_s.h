@@ -3,12 +3,19 @@
 
 #include <conexion.h>
 
+#define KS_MAX_PROCESOS 64
+
+#define KS_MOTIVO_EXIT         0
+#define KS_MOTIVO_SYSCALL      1
+#define KS_MOTIVO_INTERRUPCION 2
+#define KS_MOTIVO_SEG_FAULT    3
+
 t_log *logger;
 t_config *config;
 
 
 // Variables globales
-int fd_kernel_memory = -1;
+int fd_kernel_memory;
 
 
 void ks_registrar_io(int fd, int32_t subtipo);

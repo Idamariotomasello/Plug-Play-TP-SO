@@ -3,22 +3,7 @@
 
 #include <conexion.h>
 
-/* =========================================================
- * Registros de la CPU (según enunciado)
- * ========================================================= */
-typedef struct {
-    uint32_t PC;   /* Program Counter — índice de instrucción */
-    uint8_t  AX;
-    uint8_t  BX;
-    uint8_t  CX;
-    uint8_t  DX;
-    uint32_t EAX;
-    uint32_t EBX;
-    uint32_t ECX;
-    uint32_t EDX;
-    uint32_t SI;   /* dirección lógica origen  */
-    uint32_t DI;   /* dirección lógica destino */
-} t_registros;
+
  
 /* =========================================================
  * Contexto de ejecución — lo que viaja entre KS/KM y CPU
@@ -27,16 +12,6 @@ typedef struct {
     int32_t    pid;
     t_registros regs;
 } t_contexto;
- 
-/* =========================================================
- * Motivos de devolución del proceso al KS
- * ========================================================= */
-typedef enum {
-    MOTIVO_EXIT        = 0,
-    MOTIVO_SYSCALL     = 1,
-    MOTIVO_INTERRUPCION = 2,
-    MOTIVO_SEG_FAULT   = 3,
-} e_motivo_retorno;
  
 
 typedef struct {

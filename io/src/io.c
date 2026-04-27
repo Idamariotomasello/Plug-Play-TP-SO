@@ -9,7 +9,7 @@
 t_log    *logger = NULL;
 t_config *config = NULL;
  
-e_io_tipo g_tipo_io  = IO_TIPO_INVALIDO;
+op_code g_tipo_io  = IO_TIPO_INVALIDO;
 int       fd_ks      = -1;
  
 /* =========================================================
@@ -182,22 +182,22 @@ void io_loop(void)
  * io_tipo_nombre / io_tipo_desde_string
  * ========================================================= */
  
-const char *io_tipo_nombre(e_io_tipo tipo)
+const char *io_tipo_nombre(op_code tipo)
 {
     switch (tipo)
     {
-        case IO_TIPO_SLEEP:  return "SLEEP";
-        case IO_TIPO_STDIN:  return "STDIN";
-        case IO_TIPO_STDOUT: return "STDOUT";
+        case OP_IO_SLEEP:  return "SLEEP";
+        case OP_IO_STDIN:  return "STDIN";
+        case OP_IO_STDOUT: return "STDOUT";
         default:             return "INVALIDO";
     }
 }
  
-e_io_tipo io_tipo_desde_string(const char *s)
+op_code io_tipo_desde_string(const char *s)
 {
-    if (strcasecmp(s, "SLEEP")  == 0) return IO_TIPO_SLEEP;
-    if (strcasecmp(s, "STDIN")  == 0) return IO_TIPO_STDIN;
-    if (strcasecmp(s, "STDOUT") == 0) return IO_TIPO_STDOUT;
+    if (strcasecmp(s, "SLEEP")  == 0) return OP_IO_SLEEP;
+    if (strcasecmp(s, "STDIN")  == 0) return OP_IO_STDIN;
+    if (strcasecmp(s, "STDOUT") == 0) return OP_IO_STDOUT;
     return IO_TIPO_INVALIDO;
 }
  
