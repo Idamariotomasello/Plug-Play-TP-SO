@@ -14,9 +14,9 @@ int fd_memory_stick = -1;
 t_interrupcion interrupcion_pendiente = { .activa = false, .motivo = 0 };
 pthread_mutex_t mutex_interrupcion_pendiente = PTHREAD_MUTEX_INITIALIZER;
 
-static bool modo_test_sin_memoria = true;
-static bool usar_doble_conexion_kernel_scheduler = false;
-static bool enviar_syscall_extendida = false;
+bool modo_test_sin_memoria = false;
+bool usar_doble_conexion_kernel_scheduler = false;
+bool enviar_syscall_extendida = false;
  
 /* =========================================================
  * Helpers de registros
