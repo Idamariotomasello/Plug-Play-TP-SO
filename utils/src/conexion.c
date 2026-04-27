@@ -2,6 +2,7 @@
 
 pthread_mutex_t mutex_io = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_procesos = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex_irq = PTHREAD_MUTEX_INITIALIZER;
 
 sem_t g_sem_listo;
 
@@ -14,11 +15,13 @@ void inicializar_sincronizacion() {
     // Inicialización explícita (aunque los INITIALIZER ya lo hacen)
     pthread_mutex_init(&mutex_io, NULL);
     pthread_mutex_init(&mutex_procesos, NULL);
+    pthread_mutex_init(&mutex_irq, NULL);
 }
 
 void destruir_sincronizacion() {
     pthread_mutex_destroy(&mutex_io);
     pthread_mutex_destroy(&mutex_procesos);
+    pthread_mutex_destroy(&mutex_irq);
 }
 
 

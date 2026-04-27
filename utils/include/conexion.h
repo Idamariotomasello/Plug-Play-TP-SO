@@ -32,6 +32,7 @@ extern t_config *config;
 
 extern pthread_mutex_t mutex_io;
 extern pthread_mutex_t mutex_procesos;
+extern pthread_mutex_t mutex_irq;
 
 extern sem_t g_sem_listo;
 
@@ -102,7 +103,8 @@ typedef enum
 
     EXIT,
     SYSCALL_ERROR,
-    SYSCALL_OK
+    SYSCALL_OK,
+    MOTIVO_SEG_FAULT
 }op_code;
 
 typedef struct
