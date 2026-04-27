@@ -350,57 +350,60 @@ void km_atender_cpu(t_log *logger, int fd_cpu)
             
             case OP_GET_CONTEXTO: {
                 int32_t pid;
-                if (!recibir_int32(fd_cpu, &pid)) {
-                    log_error(logger, "Error recibiendo PID en GET_CONTEXTO");
-                    goto cpu_desconectada;
-                }
-                
+                if (!recibir_int32(fd_cpu, &pid)) goto cpu_desconectada;
+
                 log_info(logger, "CPU %d — GET_CONTEXTO PID=%d", id_cpu, pid);
-                
-                /* contexto inicial vacío */
-                uint8_t ctx_buf[44];
-                memset(ctx_buf, 0, sizeof(ctx_buf));
-                
-                if (!enviar_int32(fd_cpu, OP_OK)) {
-                    log_error(logger, "Error enviando OP_OK en GET_CONTEXTO");
-                    goto cpu_desconectada;
+
+                /* Buscar contexto guardado del proceso */
+                t_registros ctx_regs;
+                memset(&ctx_regs, 0, sizeof(t_registros));
+
+                pthread_mutex_lock(&mutex_procesos);
+                for (int i = 0; i < KM_MAX_PROCESOS; i++) {
+                    if (g_procesos[i].activo && g_procesos[i].pid == pid) {
+                        memcpy(&ctx_regs, &g_procesos[i].registros, sizeof(t_registros));
+                        break;
+                    }
                 }
-                
-                int sent = send(fd_cpu, ctx_buf, sizeof(ctx_buf), MSG_NOSIGNAL);
-                if (sent != sizeof(ctx_buf)) {
-                    log_error(logger, "Error enviando contexto");
+                pthread_mutex_unlock(&mutex_procesos);
+
+                log_info(logger, "GET_CONTEXTO: enviando contexto de %zu bytes para PID=%d (PC=%u)",
+                        sizeof(t_registros), pid, ctx_regs.PC);
+
+                if (!enviar_int32(fd_cpu, OP_OK)) goto cpu_desconectada;
+                if (send(fd_cpu, &ctx_regs, sizeof(t_registros), MSG_NOSIGNAL) != (int)sizeof(t_registros))
                     goto cpu_desconectada;
-                }
-                
-                log_info(logger, "GET_CONTEXTO completado");
+
+                log_info(logger, "GET_CONTEXTO completado (%zu bytes enviados)", sizeof(t_registros));
                 break;
             }
-            
+
             case OP_SET_CONTEXTO: {
                 int32_t pid;
-                if (!recibir_int32(fd_cpu, &pid)) {
-                    log_error(logger, "Error recibiendo PID en SET_CONTEXTO");
+                if (!recibir_int32(fd_cpu, &pid)) goto cpu_desconectada;
+
+                t_registros ctx_regs;
+                if (recv(fd_cpu, &ctx_regs, sizeof(t_registros), MSG_WAITALL) != (int)sizeof(t_registros))
                     goto cpu_desconectada;
+
+                /* Persistir el contexto */
+                pthread_mutex_lock(&mutex_procesos);
+                for (int i = 0; i < KM_MAX_PROCESOS; i++) {
+                    if (g_procesos[i].activo && g_procesos[i].pid == pid) {
+                        memcpy(&g_procesos[i].registros, &ctx_regs, sizeof(t_registros));
+                        break;
+                    }
                 }
-                
-                uint8_t ctx_buf[44];
-                int recv_size = recv(fd_cpu, ctx_buf, sizeof(ctx_buf), MSG_WAITALL);
-                if (recv_size != sizeof(ctx_buf)) {
-                    log_error(logger, "Error recibiendo contexto en SET_CONTEXTO (recibí %d)", recv_size);
-                    goto cpu_desconectada;
-                }
-                
-                log_info(logger, "CPU %d — SET_CONTEXTO PID=%d", id_cpu, pid);
-                
-                if (!enviar_int32(fd_cpu, OP_OK)) {
-                    log_error(logger, "Error enviando OK en SET_CONTEXTO");
-                    goto cpu_desconectada;
-                }
-                
+                pthread_mutex_unlock(&mutex_procesos);
+
+                log_info(logger, "CPU %d — SET_CONTEXTO PID=%d (PC guardado: %u)", id_cpu, pid, ctx_regs.PC);
+
+                if (!enviar_int32(fd_cpu, OP_OK)) goto cpu_desconectada;
                 log_info(logger, "SET_CONTEXTO completado");
                 break;
             }
-            
+
+
             default:
                 log_warning(logger, "CPU %d — op_code desconocido: %d", id_cpu, cod_op);
                 break;

@@ -58,64 +58,32 @@ void cpu_escribir_registro(t_registros *r, const char *n, uint32_t v)
 char *cpu_fetch(int32_t pid, uint32_t pc)
 {
     log_info(logger, "## PID: %d - FETCH - Program Counter: %d", pid, pc);
- 
+
     enviar_int32(fd_kernel_memory, OP_FETCH_INSTRUCCION);
     enviar_int32(fd_kernel_memory, pid);
     enviar_int32(fd_kernel_memory, (int32_t)pc);
- 
+
     int32_t resp;
-    if (!recibir_int32(fd_kernel_memory, &resp) || resp != OP_OK)
-    {
+    if (!recibir_int32(fd_kernel_memory, &resp) || resp != OP_OK) {
         log_error(logger, "FETCH: KM respondio error (PID=%d, PC=%d)", pid, pc);
         return NULL;
     }
- 
+
     int32_t tam;
-    if (!recibir_int32(fd_kernel_memory, &tam) || tam <= 0)
-        return NULL;
-    
-    
-    if (!enviar_int32(fd_kernel_memory, (int32_t)pc)) {
-        log_error(logger, "Error enviando PC en FETCH");
-        return NULL;
-    }
-
-    log_info(logger, "[FETCH] Esperando respuesta de KM... (OP_OK=%d)", OP_OK);
-    
-    if (!recibir_int32(fd_kernel_memory, &resp)) {
-        log_error(logger, "Error recibiendo respuesta en FETCH (no recibí nada)");
-        return NULL;
-    }
-    
-    log_info(logger, "[FETCH] Respuesta recibida: %d (esperaba OP_OK=%d)", resp, OP_OK);
-    
-    if (resp != OP_OK) {
-        log_error(logger, "FETCH: KM respondio error (PID=%d, PC=%d, resp=%d, esperaba %d)", pid, pc, resp, OP_OK);
-        return NULL;
-    }
-
-    if (!recibir_int32(fd_kernel_memory, &tam)) {
-        log_error(logger, "Error recibiendo tamaño de instrucción");
-        return NULL;
-    }
-    
-    log_info(logger, "[FETCH] Tamaño recibido: %d bytes", tam);
-
-    if (tam <= 0 || tam > 256) {
-        log_error(logger, "Tamaño inválido: %d", tam);
+    if (!recibir_int32(fd_kernel_memory, &tam) || tam <= 0 || tam > 256) {
+        log_error(logger, "FETCH: tamaño inválido (PID=%d, PC=%d)", pid, pc);
         return NULL;
     }
 
     char *instruccion = malloc(tam + 1);
-    if (recv(fd_kernel_memory, instruccion, tam, MSG_WAITALL) != tam)
-    {
+    if (recv(fd_kernel_memory, instruccion, tam, MSG_WAITALL) != tam) {
+        log_error(logger, "FETCH: error recibiendo instrucción (PID=%d, PC=%d)", pid, pc);
         free(instruccion);
         return NULL;
     }
-    
+
     instruccion[tam] = '\0';
-    log_info(logger, "[FETCH] Instrucción recibida: '%s'", instruccion);
-    
+    log_info(logger, "## PID: %d - PC: %d - Instrucción: '%s'", pid, pc, instruccion);
     return instruccion;
 }
 
@@ -201,13 +169,14 @@ static void cpu_cargar_syscall(t_syscall_pendiente *syscall,
     syscall->valor_2 = valor_2;
 }
 
-static void cpu_avanzar_pc_si_corresponde(t_contexto *ctx, bool modifico_pc)
+void cpu_avanzar_pc_si_corresponde(t_contexto *ctx, bool modifico_pc)
 {
     if (!modifico_pc)
         ctx->regs.PC++;
 }
 
-static bool cpu_enviar_string(int fd, const char *texto)
+/*
+bool cpu_enviar_string(int fd, const char *texto)
 {
     int32_t largo = texto ? (int32_t)strlen(texto) : 0;
     enviar_int32(fd, largo);
@@ -217,6 +186,7 @@ static bool cpu_enviar_string(int fd, const char *texto)
 
     return send(fd, texto, largo, MSG_NOSIGNAL) == largo;
 }
+*/
 
 bool cpu_conectar_kernel_scheduler(const char *ip, int puerto)
 {
@@ -252,18 +222,34 @@ bool cpu_enviar_retorno_kernel_scheduler(int32_t pid, e_motivo_retorno motivo, c
     enviar_int32(fd_kernel_scheduler_dispatch, pid);
     enviar_int32(fd_kernel_scheduler_dispatch, (int32_t)motivo);
 
-    if (motivo != MOTIVO_SYSCALL || !enviar_syscall_extendida || syscall == NULL)
-        return true;
+    /* Siempre enviar datos de syscall cuando corresponde */
+    if (motivo == MOTIVO_SYSCALL && syscall != NULL) {
+        /* nombre (largo + bytes) */
+        int32_t largo_nombre = (int32_t)strlen(syscall->nombre);
+        enviar_int32(fd_kernel_scheduler_dispatch, largo_nombre);
+        if (largo_nombre > 0)
+            send(fd_kernel_scheduler_dispatch, syscall->nombre, largo_nombre, MSG_NOSIGNAL);
 
-    enviar_int32(fd_kernel_scheduler_dispatch, (int32_t)syscall->tipo);
-    if (!cpu_enviar_string(fd_kernel_scheduler_dispatch, syscall->nombre))
-        return false;
-    if (!cpu_enviar_string(fd_kernel_scheduler_dispatch, syscall->parametro_1))
-        return false;
-    if (!cpu_enviar_string(fd_kernel_scheduler_dispatch, syscall->parametro_2))
-        return false;
-    enviar_int32(fd_kernel_scheduler_dispatch, (int32_t)syscall->valor_1);
-    enviar_int32(fd_kernel_scheduler_dispatch, (int32_t)syscall->valor_2);
+        /* parametro_1 */
+        int32_t largo_p1 = (int32_t)strlen(syscall->parametro_1);
+        enviar_int32(fd_kernel_scheduler_dispatch, largo_p1);
+        if (largo_p1 > 0)
+            send(fd_kernel_scheduler_dispatch, syscall->parametro_1, largo_p1, MSG_NOSIGNAL);
+
+        /* parametro_2 */
+        int32_t largo_p2 = (int32_t)strlen(syscall->parametro_2);
+        enviar_int32(fd_kernel_scheduler_dispatch, largo_p2);
+        if (largo_p2 > 0)
+            send(fd_kernel_scheduler_dispatch, syscall->parametro_2, largo_p2, MSG_NOSIGNAL);
+
+        /* valores numéricos */
+        enviar_int32(fd_kernel_scheduler_dispatch, (int32_t)syscall->valor_1);
+        enviar_int32(fd_kernel_scheduler_dispatch, (int32_t)syscall->valor_2);
+
+        log_info(logger, "## PID: %d - Syscall enviada al KS: %s (%s, %s) vals: %u %u",
+                 pid, syscall->nombre, syscall->parametro_1, syscall->parametro_2,
+                 syscall->valor_1, syscall->valor_2);
+    }
 
     return true;
 }
@@ -284,7 +270,8 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
 
     /* Instrucciones de registro */
     if (!strcmp(op, "NOOP")) {
-        log_info(logger, "[EXECUTE] NOOP - sin operación");
+        log_info(logger, "## PID: %d - Instruccion: NOOP - ciclo sin operacion", ctx->pid);
+        /* Sin acción, PC avanza normalmente al final */
     }
     else if (!strcmp(op, "SET")) {
         if (campos < 3) {
@@ -294,7 +281,7 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
         }
         uint32_t val = (uint32_t)atoi(a2);
         cpu_escribir_registro(&ctx->regs, a1, val);
-        log_info(logger, "[EXECUTE] SET %s = %u", a1, val);
+        log_info(logger, "## PID: %d - Instruccion: SET - %s = %u", ctx->pid, a1, val);
     }
     else if (!strcmp(op, "SUM")) {
         if (campos < 3) {

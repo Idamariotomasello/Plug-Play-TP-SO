@@ -397,6 +397,39 @@ void *atender_cliente_ks(void *varg)
                 break;
             }
 
+            if (motivo == KS_MOTIVO_SYSCALL) {
+                int32_t largo;
+                if (!recibir_int32(fd, &largo)) break;
+                if (largo > 0 && largo < 64) {
+                    if (recv(fd, pcb->syscall_nombre, largo, MSG_WAITALL) != largo) break;
+                    pcb->syscall_nombre[largo] = '\0';
+                } else {
+                    pcb->syscall_nombre[0] = '\0';
+                }
+
+                if (!recibir_int32(fd, &largo)) break;
+                if (largo > 0 && largo < 64) {
+                    if (recv(fd, pcb->syscall_arg1, largo, MSG_WAITALL) != largo) break;
+                    pcb->syscall_arg1[largo] = '\0';
+                } else {
+                    pcb->syscall_arg1[0] = '\0';
+                }
+
+                if (!recibir_int32(fd, &largo)) break;
+                if (largo > 0 && largo < 64) {
+                    if (recv(fd, pcb->syscall_arg2, largo, MSG_WAITALL) != largo) break;
+                    pcb->syscall_arg2[largo] = '\0';
+                } else {
+                    pcb->syscall_arg2[0] = '\0';
+                }
+
+                int32_t val1, val2;
+                if (!recibir_int32(fd, &val1) || !recibir_int32(fd, &val2)) break;
+
+                log_info(logger, "## CPU %d — syscall recibida: '%s' arg1='%s' arg2='%s' vals=%d,%d",
+                        id_cpu, pcb->syscall_nombre, pcb->syscall_arg1, pcb->syscall_arg2, val1, val2);
+            }
+
             const char *nombre_motivo;
             if (motivo == KS_MOTIVO_EXIT) nombre_motivo = "EXIT";
             else if (motivo == KS_MOTIVO_SYSCALL) nombre_motivo = "SYSCALL";
@@ -430,6 +463,14 @@ void *atender_cliente_ks(void *varg)
                     break;
 
                 case KS_MOTIVO_INTERRUPCION:
+                    ks_cambiar_estado(pcb, ESTADO_READY);
+                    sem_post(&g_sem_ready);
+                    break;
+
+
+                case KS_MOTIVO_NINGUNO:   /* ciclo normal, ej: NOOP */
+                    log_info(logger, "## (%d) - CPU completó ciclo sin evento (NOOP u op normal)",
+                            pid_ret);
                     ks_cambiar_estado(pcb, ESTADO_READY);
                     sem_post(&g_sem_ready);
                     break;

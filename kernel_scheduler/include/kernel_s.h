@@ -9,6 +9,7 @@
 #define KS_MOTIVO_SYSCALL      1
 #define KS_MOTIVO_INTERRUPCION 2
 #define KS_MOTIVO_SEG_FAULT    3
+#define KS_MOTIVO_NINGUNO      4
 
 t_log *logger;
 t_config *config;

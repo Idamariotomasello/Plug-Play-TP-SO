@@ -11,6 +11,7 @@ typedef struct {
     char   **instrucciones;
     int      n_instrucciones;
     bool     activo;
+    t_registros registros; 
 } t_proceso_km;
 
 typedef struct
