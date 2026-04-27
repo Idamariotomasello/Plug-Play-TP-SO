@@ -13,17 +13,6 @@ typedef struct {
     t_registros regs;
 } t_contexto;
  
-<<<<<<< HEAD
-=======
-/* =========================================================
- * Motivos de devolución del proceso al KS
- * ========================================================= */
-typedef enum {
-    MOTIVO_EXIT        = 0,
-    MOTIVO_SYSCALL     = 1,
-    MOTIVO_INTERRUPCION = 2,
-    MOTIVO_SEG_FAULT   = 3,
-} e_motivo_retorno;
 
 typedef enum {
     SYSCALL_NINGUNA = 0,
@@ -47,7 +36,6 @@ typedef struct {
     uint32_t valor_2;
 } t_syscall_pendiente;
  
->>>>>>> origin/rama-guido
 
 typedef struct {
     bool    activa;

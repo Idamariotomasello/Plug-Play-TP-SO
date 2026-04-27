@@ -82,7 +82,6 @@ char *cpu_fetch(int32_t pid, uint32_t pc)
 
     log_info(logger, "[FETCH] Esperando respuesta de KM... (OP_OK=%d)", OP_OK);
     
-    int32_t resp;
     if (!recibir_int32(fd_kernel_memory, &resp)) {
         log_error(logger, "Error recibiendo respuesta en FETCH (no recibí nada)");
         return NULL;
@@ -95,7 +94,6 @@ char *cpu_fetch(int32_t pid, uint32_t pc)
         return NULL;
     }
 
-    int32_t tam;
     if (!recibir_int32(fd_kernel_memory, &tam)) {
         log_error(logger, "Error recibiendo tamaño de instrucción");
         return NULL;

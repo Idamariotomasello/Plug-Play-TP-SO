@@ -103,8 +103,7 @@ typedef enum
 
     EXIT,
     SYSCALL_ERROR,
-    SYSCALL_OK,
-    MOTIVO_SEG_FAULT
+    SYSCALL_OK
 }op_code;
 
 typedef struct
@@ -147,7 +146,8 @@ typedef enum {
     MOTIVO_SYSCALL = 1,
     MOTIVO_INTERRUPCION = 2,
     MOTIVO_ERROR = 3,
-    MOTIVO_EXIT = 4
+    MOTIVO_EXIT = 4,
+    MOTIVO_SEG_FAULT = 5
 } e_motivo_retorno;
 
 typedef struct s_pcb {
