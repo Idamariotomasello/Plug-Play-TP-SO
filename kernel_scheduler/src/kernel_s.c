@@ -456,13 +456,11 @@ void ks_procesar_syscall(t_pcb *pcb)
                !strcmp(op, "MEM_FREE")) {
         /* TODO checkpoint 2/3 */
         log_info(logger, "## (%d) - syscall %s pendiente de implementacion", pcb->pid, op);
-        ks_cambiar_estado(pcb, ESTADO_READY);
-        sem_post(&g_sem_ready);
+        ks_encolar_ready(pcb);
 
     } else {
         log_warning(logger, "## (%d) - syscall desconocida: %s", pcb->pid, op);
-        ks_cambiar_estado(pcb, ESTADO_READY);
-        sem_post(&g_sem_ready);
+        ks_encolar_ready(pcb);
     }
 }
 
