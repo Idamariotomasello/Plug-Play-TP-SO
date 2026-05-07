@@ -14,7 +14,6 @@ int       fd_kernel_memory = -1;
 int             fd_io_sleep  = -1;
 int             fd_io_stdin  = -1;
 int             fd_io_stdout = -1;
-pthread_mutex_t mutex_io     = PTHREAD_MUTEX_INITIALIZER;
 
 /* PCBs del planificador */
 t_pcb        g_ks_pcbs[KS_MAX_PROCESOS];
@@ -54,7 +53,7 @@ void ks_cambiar_estado(t_pcb *pcb, e_estado_proceso nuevo)
  * Gestión de PCBs del planificador
  * ========================================================= */
 
-static t_pcb *ks_crear_pcb(int32_t pid, int32_t prioridad)
+t_pcb *ks_crear_pcb(int32_t pid, int32_t prioridad)
 {
     pthread_mutex_lock(&g_mutex_ks_pcbs);
     t_pcb *pcb = NULL;
@@ -73,7 +72,7 @@ static t_pcb *ks_crear_pcb(int32_t pid, int32_t prioridad)
     return pcb;
 }
 
-static t_pcb *ks_buscar_pcb(int32_t pid)
+t_pcb *ks_buscar_pcb(int32_t pid)
 {
     pthread_mutex_lock(&g_mutex_ks_pcbs);
     t_pcb *pcb = NULL;
@@ -85,7 +84,7 @@ static t_pcb *ks_buscar_pcb(int32_t pid)
 }
 
 /* Busca el primer proceso en estado READY (FIFO simple) */
-static t_pcb *ks_primer_ready(void)
+t_pcb *ks_primer_ready(void)
 {
     pthread_mutex_lock(&g_mutex_ks_pcbs);
     t_pcb *pcb = NULL;
@@ -178,8 +177,7 @@ bool ks_despachar_io_sleep(int32_t pid, int32_t tiempo_ms)
 
     log_info(logger, "## (%d) finalizó IO y pasa a READY / SUSP. READY", pid);
     if (pcb) {
-        ks_cambiar_estado(pcb, ESTADO_READY);
-        sem_post(&g_sem_ready);
+        ks_encolar_ready(pcb);
     }
     return true;
 }
@@ -225,8 +223,7 @@ bool ks_despachar_io_stdin(int32_t pid, int32_t cantidad)
     log_info(logger, "## (%d) finalizó IO y pasa a READY / SUSP. READY", pid);
     free(datos);
     if (pcb) {
-        ks_cambiar_estado(pcb, ESTADO_READY);
-        sem_post(&g_sem_ready);
+        ks_encolar_ready(pcb);
     }
     return true;
 }
@@ -260,8 +257,7 @@ bool ks_despachar_io_stdout(int32_t pid, void *datos, int32_t tamanio)
 
     log_info(logger, "## (%d) finalizó IO y pasa a READY / SUSP. READY", pid);
     if (pcb) {
-        ks_cambiar_estado(pcb, ESTADO_READY);
-        sem_post(&g_sem_ready);
+        ks_encolar_ready(pcb);
     }
     return true;
 }
@@ -296,7 +292,7 @@ void ks_syscall_io(int32_t subtipo, int32_t pid, void *param, int32_t param_size
  * Parsea la instrucción del PCB y despacha al dispositivo correcto.
  * ========================================================= */
 
-static void ks_procesar_syscall(t_pcb *pcb)
+void ks_procesar_syscall(t_pcb *pcb)
 {
     const char *op  = pcb->syscall_nombre;
     const char *a1  = pcb->syscall_arg1;
@@ -319,13 +315,145 @@ static void ks_procesar_syscall(t_pcb *pcb)
         char mock_datos[] = "(datos pendientes KM)";
         ks_despachar_io_stdout(pcb->pid, mock_datos, strlen(mock_datos));
 
+    } else if (!strcmp(op, "INIT_PROC")) {
+
+        const char *nombre_script = pcb->syscall_arg1;
+        const char *prio_str      = pcb->syscall_arg2;
+        int32_t     prioridad     = atoi(prio_str);
+
+        static int32_t g_next_pid = 1;
+        int32_t nuevo_pid = __atomic_fetch_add(&g_next_pid, 1, __ATOMIC_SEQ_CST);
+
+        /* ── Log de contexto ── */
+        log_info(logger,
+                "## (%d) - INIT_PROC: script='%s' prioridad=%d → asignando PID %d",
+                pcb->pid, nombre_script, prioridad, nuevo_pid);
+
+        log_info(logger,
+                "## (%d) - INIT_PROC: algoritmo activo = %s",
+                pcb->pid,
+                g_algoritmo == ALGO_FIFO ? "FIFO" :
+                g_algoritmo == ALGO_RR   ? "RR"   : "CMN");
+
+        if (g_algoritmo == ALGO_FIFO || g_algoritmo == ALGO_RR) {
+            log_info(logger,
+                    "## (%d) - INIT_PROC: [%s] prioridad del hijo (%d) NO tiene injerencia — "
+                    "se usará orden de llegada",
+                    pcb->pid,
+                    g_algoritmo == ALGO_FIFO ? "FIFO" : "RR",
+                    prioridad);
+        } else {
+            log_info(logger,
+                    "## (%d) - INIT_PROC: [CMN] prioridad del hijo (%d) DETERMINA posición en cola — "
+                    "QUEUE_PREEMPTION=%s",
+                    pcb->pid, prioridad,
+                    g_preemption ? "TRUE" : "FALSE");
+        }
+
+        /* ── Notificar al KM (con mutex para serializar el socket) ── */
+        log_info(logger,
+                "## (%d) - INIT_PROC: enviando OP_CREAR_PROCESO al KM "
+                "(PID=%d script='%s' prioridad=%d)",
+                pcb->pid, nuevo_pid, nombre_script, prioridad);
+
+        pthread_mutex_lock(&mutex_km);
+
+        t_paquete *paq = crear_paquete(OP_CREAR_PROCESO, logger);
+        agregar_a_paquete(paq, &nuevo_pid,           sizeof(int32_t));
+        agregar_a_paquete(paq, &prioridad,           sizeof(int32_t));
+        agregar_a_paquete(paq, (void*)nombre_script, strlen(nombre_script));
+        enviar_paquete(paq, fd_kernel_memory, logger);
+        eliminar_paquete(paq);
+
+        int32_t resp_km;
+        bool km_ok = recibir_int32(fd_kernel_memory, &resp_km) && resp_km == OP_OK;
+
+        pthread_mutex_unlock(&mutex_km);
+
+        if (!km_ok) {
+            log_error(logger,
+                    "## (%d) - INIT_PROC: KM respondió ERROR — script '%s' no encontrado o inválido",
+                    pcb->pid, nombre_script);
+            log_info(logger,
+                    "## (%d) - INIT_PROC: proceso padre vuelve a READY sin crear hijo",
+                    pcb->pid);
+            ks_encolar_ready(pcb);
+            return;
+        }
+
+        log_info(logger,
+                "## (%d) - INIT_PROC: KM confirmó creación de PID %d",
+                pcb->pid, nuevo_pid);
+
+        /* ── Crear PCB del hijo ── */
+        t_pcb *hijo = ks_crear_pcb(nuevo_pid, prioridad);
+        if (!hijo) {
+            log_error(logger,
+                    "## (%d) - INIT_PROC: sin espacio para PCB de PID %d — "
+                    "proceso padre vuelve a READY",
+                    pcb->pid, nuevo_pid);
+            ks_encolar_ready(pcb);
+            return;
+        }
+        log_info(logger, "## (<%d>) Se crea el proceso - Estado: NEW", nuevo_pid);
+
+        /* ── Encolar según algoritmo ── */
+        if (g_algoritmo == ALGO_FIFO) {
+            log_info(logger,
+                    "## (%d) - INIT_PROC: [FIFO] hijo PID %d → FINAL de READY "
+                    "(espera que proceso actual finalice con EXIT)",
+                    pcb->pid, nuevo_pid);
+            ks_encolar_ready(hijo);
+
+            log_info(logger,
+                    "## (%d) - INIT_PROC: [FIFO] padre PID %d → FINAL de READY "
+                    "(detrás del hijo recién creado)",
+                    pcb->pid, pcb->pid);
+            ks_encolar_ready(pcb);
+
+        } else if (g_algoritmo == ALGO_RR) {
+            log_info(logger,
+                    "## (%d) - INIT_PROC: [RR] hijo PID %d → FINAL de READY "
+                    "(quantum=%d ms, espera su turno)",
+                    pcb->pid, nuevo_pid, g_quantum_ms);
+            ks_encolar_ready(hijo);
+
+            log_info(logger,
+                    "## (%d) - INIT_PROC: [RR] padre PID %d → FINAL de READY "
+                    "(quantum=%d ms, espera su turno)",
+                    pcb->pid, pcb->pid, g_quantum_ms);
+            ks_encolar_ready(pcb);
+
+        } else {
+            /* CMN */
+            log_info(logger,
+                    "## (%d) - INIT_PROC: [CMN] hijo PID %d prioridad=%d → "
+                    "posición en cola por prioridad",
+                    pcb->pid, nuevo_pid, prioridad);
+            ks_encolar_ready(hijo);
+
+            log_info(logger,
+                    "## (%d) - INIT_PROC: [CMN] padre PID %d prioridad=%d → "
+                    "posición en cola por prioridad",
+                    pcb->pid, pcb->prioridad, pcb->pid);
+            ks_encolar_ready(pcb);
+
+            if (g_preemption) {
+                log_info(logger,
+                        "## (%d) - INIT_PROC: [CMN] QUEUE_PREEMPTION=TRUE — "
+                        "verificar si hijo PID %d (prio=%d) desaloja proceso en EXEC",
+                        pcb->pid, nuevo_pid, prioridad);
+                /* TODO: enviar interrupción a CPU si hay proceso en EXEC con menor prioridad */
+            }
+        }
+
     } else if (!strcmp(op, "EXIT")) {
         ks_cambiar_estado(pcb, ESTADO_EXIT);
         log_info(logger, "## (%d) finalizó su ejecución con motivo de EXIT", pcb->pid);
 
     } else if (!strcmp(op, "MUTEX_CREATE") || !strcmp(op, "MUTEX_LOCK") ||
                !strcmp(op, "MUTEX_UNLOCK") || !strcmp(op, "MEM_ALLOC")  ||
-               !strcmp(op, "MEM_FREE")     || !strcmp(op, "INIT_PROC")) {
+               !strcmp(op, "MEM_FREE")) {
         /* TODO checkpoint 2/3 */
         log_info(logger, "## (%d) - syscall %s pendiente de implementacion", pcb->pid, op);
         ks_cambiar_estado(pcb, ESTADO_READY);
@@ -375,10 +503,9 @@ void *atender_cliente_ks(void *varg)
             log_info(logger, "CPU %d esperando proceso READY...", id_cpu);
             sem_wait(&g_sem_ready);
 
-            t_pcb *pcb = ks_primer_ready();
+            t_pcb *pcb = cola_ready_desencolar();
             if (!pcb) {
-                /* señal espuria — devolver al semáforo */
-                log_warning(logger, "CPU %d: sem_wait desbloqueado sin READY", id_cpu);
+                log_warning(logger, "CPU %d: sem_wait sin proceso en cola — señal espuria", id_cpu);
                 continue;
             }
 
@@ -392,8 +519,7 @@ void *atender_cliente_ks(void *varg)
             int32_t pid_ret, motivo;
             if (!recibir_int32(fd, &pid_ret) || !recibir_int32(fd, &motivo)) {
                 log_error(logger, "CPU %d — error recibiendo devolución", id_cpu);
-                ks_cambiar_estado(pcb, ESTADO_READY);
-                sem_post(&g_sem_ready);
+                ks_encolar_ready(pcb); /* reencolar para intentar ejecutar en otra CPU */
                 break;
             }
 
@@ -431,11 +557,15 @@ void *atender_cliente_ks(void *varg)
             }
 
             const char *nombre_motivo;
-            if (motivo == KS_MOTIVO_EXIT) nombre_motivo = "EXIT";
-            else if (motivo == KS_MOTIVO_SYSCALL) nombre_motivo = "SYSCALL";
-            else if (motivo == KS_MOTIVO_INTERRUPCION) nombre_motivo = "INTERRUPCION";
-            else if (motivo == KS_MOTIVO_SEG_FAULT) nombre_motivo = "SEG_FAULT";
-            else nombre_motivo = "DESCONOCIDO";
+            switch (motivo) {
+                case MOTIVO_EXIT:          nombre_motivo = "EXIT"; break;
+                case MOTIVO_SYSCALL:       nombre_motivo = "SYSCALL"; break;
+                case MOTIVO_INTERRUPCION:  nombre_motivo = "INTERRUPCION"; break;
+                case MOTIVO_ERROR:         nombre_motivo = "ERROR"; break;
+                case MOTIVO_SEG_FAULT:     nombre_motivo = "SEG_FAULT"; break;
+                case MOTIVO_NINGUNO:       nombre_motivo = "NINGUNO"; break;
+                default:                   nombre_motivo = "DESCONOCIDO"; break;
+            }
             
             log_info(logger, "## CPU %d devolvio PID %d — motivo: %d (%s)",
                      id_cpu, pid_ret, motivo, nombre_motivo);
@@ -463,22 +593,19 @@ void *atender_cliente_ks(void *varg)
                     break;
 
                 case KS_MOTIVO_INTERRUPCION:
-                    ks_cambiar_estado(pcb, ESTADO_READY);
-                    sem_post(&g_sem_ready);
+                    ks_encolar_ready(pcb);
                     break;
 
 
                 case KS_MOTIVO_NINGUNO:   /* ciclo normal, ej: NOOP */
                     log_info(logger, "## (%d) - CPU completó ciclo sin evento (NOOP u op normal)",
                             pid_ret);
-                    ks_cambiar_estado(pcb, ESTADO_READY);
-                    sem_post(&g_sem_ready);
+                    ks_encolar_ready(pcb);
                     break;
 
                 default:
                     log_warning(logger, "Motivo desconocido: %d", motivo);
-                    ks_cambiar_estado(pcb, ESTADO_READY);
-                    sem_post(&g_sem_ready);
+                    ks_encolar_ready(pcb);
                     break;
             }
         }
@@ -535,11 +662,131 @@ void iniciar_servidor_puerto_escucha(void)
     close(fd_escucha);
 }
 
+
+/* Encola al FINAL — usado por FIFO, RR y padre en CMN */
+void cola_ready_encolar_final(t_pcb *pcb)
+{
+    t_nodo_ready *nodo = malloc(sizeof(t_nodo_ready));
+    nodo->pcb       = pcb;
+    nodo->siguiente = NULL;
+
+    pthread_mutex_lock(&g_mutex_cola_ready);
+    if (!g_cola_ready_tail) {
+        g_cola_ready_head = g_cola_ready_tail = nodo;
+    } else {
+        g_cola_ready_tail->siguiente = nodo;
+        g_cola_ready_tail = nodo;
+    }
+    pthread_mutex_unlock(&g_mutex_cola_ready);
+}
+
+/* Encola al FRENTE — usado cuando un proceso desalojado vuelve al inicio */
+void cola_ready_encolar_frente(t_pcb *pcb)
+{
+    t_nodo_ready *nodo = malloc(sizeof(t_nodo_ready));
+    nodo->pcb       = pcb;
+    nodo->siguiente = NULL;
+
+    pthread_mutex_lock(&g_mutex_cola_ready);
+    nodo->siguiente   = g_cola_ready_head;
+    g_cola_ready_head = nodo;
+    if (!g_cola_ready_tail)
+        g_cola_ready_tail = nodo;
+    pthread_mutex_unlock(&g_mutex_cola_ready);
+}
+
+/* Encola por prioridad — usado por CMN
+ * Prioridad 0 = máxima. Igual prioridad → al final del grupo (FIFO dentro del nivel) */
+void cola_ready_encolar_cmn(t_pcb *pcb)
+{
+    t_nodo_ready *nuevo = malloc(sizeof(t_nodo_ready));
+    nuevo->pcb       = pcb;
+    nuevo->siguiente = NULL;
+
+    pthread_mutex_lock(&g_mutex_cola_ready);
+
+    if (!g_cola_ready_head) {
+        g_cola_ready_head = g_cola_ready_tail = nuevo;
+    } else if (pcb->prioridad < g_cola_ready_head->pcb->prioridad) {
+        /* Mayor prioridad que todos — va al frente */
+        nuevo->siguiente  = g_cola_ready_head;
+        g_cola_ready_head = nuevo;
+    } else {
+        /* Buscar posición: insertar DESPUÉS de los nodos con prioridad <= pcb->prioridad
+         * (FIFO dentro del mismo nivel de prioridad) */
+        t_nodo_ready *cur = g_cola_ready_head;
+        while (cur->siguiente &&
+               cur->siguiente->pcb->prioridad <= pcb->prioridad)
+            cur = cur->siguiente;
+        nuevo->siguiente = cur->siguiente;
+        cur->siguiente   = nuevo;
+        if (!nuevo->siguiente)
+            g_cola_ready_tail = nuevo;
+    }
+
+    pthread_mutex_unlock(&g_mutex_cola_ready);
+}
+
+/* Desencola el primero */
+t_pcb *cola_ready_desencolar(void)
+{
+    pthread_mutex_lock(&g_mutex_cola_ready);
+    if (!g_cola_ready_head) {
+        pthread_mutex_unlock(&g_mutex_cola_ready);
+        return NULL;
+    }
+    t_nodo_ready *nodo = g_cola_ready_head;
+    g_cola_ready_head  = nodo->siguiente;
+    if (!g_cola_ready_head)
+        g_cola_ready_tail = NULL;
+    pthread_mutex_unlock(&g_mutex_cola_ready);
+
+    t_pcb *pcb = nodo->pcb;
+    free(nodo);
+    return pcb;
+}
+
+/* Encola un PCB en READY según el algoritmo activo y loguea el motivo */
+void ks_encolar_ready(t_pcb *pcb)
+{
+    ks_cambiar_estado(pcb, ESTADO_READY);
+
+    switch (g_algoritmo) {
+
+        case ALGO_FIFO:
+            log_info(logger,
+                     "## (%d) — [FIFO] prioridad ignorada — encolando al final de READY",
+                     pcb->pid);
+            cola_ready_encolar_final(pcb);
+            break;
+
+        case ALGO_RR:
+            log_info(logger,
+                     "## (%d) — [RR] prioridad ignorada — encolando al final de READY "
+                     "(quantum=%d ms)",
+                     pcb->pid, g_quantum_ms);
+            cola_ready_encolar_final(pcb);
+            break;
+
+        case ALGO_CMN:
+            log_info(logger,
+                     "## (%d) — [CMN] encolando por prioridad %d "
+                     "(QUEUE_PREEMPTION=%s)",
+                     pcb->pid, pcb->prioridad,
+                     g_preemption ? "TRUE" : "FALSE");
+            cola_ready_encolar_cmn(pcb);
+            break;
+    }
+
+    sem_post(&g_sem_ready);
+}
+
+
 /* =========================================================
  * main
  * ========================================================= */
 
-int main(int argc, char *argv[])
+ int main(int argc, char *argv[])
 {
     if (argc < 2) {
         fprintf(stderr, "Uso: %s kernel_s.config [nombre_script]\n", argv[0]);
@@ -562,6 +809,43 @@ int main(int argc, char *argv[])
         log_error(logger, "No se pudo cargar '%s'", argv[1]);
         log_destroy(logger); return 1;
     }
+
+    /* ===== LECTURA DE PARÁMETROS DE CONFIGURACIÓN ===== */
+    char *algoritmo_planificacion = config_get_string_value(config, "PLANIFICATION_ALGORITHM");
+    char *cola_algoritmos         = config_get_string_value(config, "QUEUES_ALGORITHMS");
+    int   quantum_rr              = config_get_int_value(config, "RR_QUANTUM");
+    char *preemption_str = config_get_string_value(config, "QUEUE_PREEMPTION");
+    int interrupcion_cola = (strcmp(preemption_str, "TRUE") == 0);
+    int   timeout_suspension      = config_get_int_value(config, "SUSPENSION_TIMEOUT");
+
+    /* Mostrar por pantalla */
+    printf("\n========== CONFIGURACIÓN DEL KERNEL SCHEDULER ==========\n");
+    printf("Algoritmo de planificación : %s\n", algoritmo_planificacion);
+    printf("Cola de algoritmos         : %s\n", cola_algoritmos);
+    printf("Quantum RR (ms)            : %d\n", quantum_rr);
+    printf("Interrupción por cola      : %s\n", interrupcion_cola ? "TRUE" : "FALSE");
+    printf("Timeout de suspensión (ms) : %d\n", timeout_suspension);
+    printf("=======================================================\n\n");
+
+    /* ===================================================== */
+
+    /* ── Inicializar globales de planificación desde los valores leídos ── */
+    if      (!strcmp(algoritmo_planificacion, "RR"))  g_algoritmo = ALGO_RR;
+    else if (!strcmp(algoritmo_planificacion, "CMN")) g_algoritmo = ALGO_CMN;
+    else                                               g_algoritmo = ALGO_FIFO;
+
+    g_quantum_ms    = quantum_rr;
+    g_preemption    = (interrupcion_cola != 0);
+    g_suspension_ms = timeout_suspension;
+
+    log_info(logger, "Planificador: algoritmo=%s quantum=%d ms preemption=%s suspension=%d ms",
+             algoritmo_planificacion, g_quantum_ms,
+             g_preemption ? "TRUE" : "FALSE", g_suspension_ms);
+
+    free(algoritmo_planificacion);
+    free(cola_algoritmos);
+    free(preemption_str);
+    /* ================================================================ */
 
     /* Semáforo READY arranca en 0 — se señaliza cuando hay proceso listo */
     sem_init(&g_sem_ready, 0, 0);
@@ -608,8 +892,7 @@ int main(int argc, char *argv[])
         log_warning(logger, "KM no confirmo creacion de PID 0");
 
     /* NEW → READY */
-    ks_cambiar_estado(pcb0, ESTADO_READY);
-    sem_post(&g_sem_ready);   /* señalizar que hay un proceso listo */
+    ks_encolar_ready(pcb0);
 
     log_info(logger, "PID 0 en READY — script: %s, prioridad: %d", script, prio0);
 

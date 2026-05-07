@@ -5,14 +5,21 @@
 
 #define KS_MAX_PROCESOS 64
 
-#define KS_MOTIVO_EXIT         0
+#define KS_MOTIVO_EXIT         4
 #define KS_MOTIVO_SYSCALL      1
 #define KS_MOTIVO_INTERRUPCION 2
 #define KS_MOTIVO_SEG_FAULT    3
-#define KS_MOTIVO_NINGUNO      4
+#define KS_MOTIVO_NINGUNO      0
 
 t_log *logger;
 t_config *config;
+
+typedef enum { ALGO_FIFO, ALGO_RR, ALGO_CMN } e_algoritmo;
+
+e_algoritmo g_algoritmo;
+int32_t     g_quantum_ms;
+bool        g_preemption;
+int32_t     g_suspension_ms;
 
 
 // Variables globales
@@ -20,6 +27,10 @@ int fd_kernel_memory;
 
 
 void ks_registrar_io(int fd, int32_t subtipo);
+void ks_encolar_ready(t_pcb *pcb);
+t_pcb *cola_ready_desencolar(void);
+void cola_ready_encolar_frente(t_pcb *pcb);
+t_pcb *ks_primer_ready(void);
 int ks_fd_io(int32_t subtipo);
 const char *ks_nombre_io(int32_t subtipo);
 bool ks_despachar_io_sleep(int32_t pid, int32_t tiempo_ms);

@@ -33,9 +33,10 @@ extern t_config *config;
 extern pthread_mutex_t mutex_io;
 extern pthread_mutex_t mutex_procesos;
 extern pthread_mutex_t mutex_irq;
+extern pthread_mutex_t mutex_km;
+extern pthread_mutex_t  g_mutex_cola_ready;
 
 extern sem_t g_sem_listo;
-
 
 
 typedef struct {
@@ -174,6 +175,14 @@ typedef struct
 } t_paquete;
 
 
+typedef struct s_nodo_ready {
+    t_pcb              *pcb;
+    struct s_nodo_ready *siguiente;
+} t_nodo_ready;
+
+
+extern t_nodo_ready    *g_cola_ready_head;
+extern t_nodo_ready    *g_cola_ready_tail;
 
 void inicializar_semaforos();
 void destruir_semaforos();

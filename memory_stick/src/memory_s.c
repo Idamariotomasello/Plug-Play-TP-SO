@@ -160,9 +160,10 @@ void *ms_atender_cpu(void *varg)
             }
  
             default:
-                log_warning(logger, "CPU (fd=%d) — cod_op desconocido: %d",
-                            fd_cpu, cod_op);
-                break;
+            log_warning(logger, "CPU %d (fd=%d) — cod_op desconocido: %d (0x%X) — posible desincronización de protocolo",
+                        id_cpu, fd_cpu, cod_op, cod_op);
+            /* No cerrar — podría ser un mensaje fuera de orden; continuar leyendo */
+            break;
         }
     }
  

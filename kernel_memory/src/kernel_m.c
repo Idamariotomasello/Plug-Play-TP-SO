@@ -8,6 +8,7 @@ t_log *g_logger = NULL;
 
 t_proceso_km g_procesos[KM_MAX_PROCESOS];
 bool g_procesos_init = false;
+char g_scripts_basepath[1024] = {0};
 
 int g_cpus_conectadas = 0;
 int g_ms_conectados   = 0;
@@ -146,17 +147,14 @@ void km_procesar_crear_proceso(int fd_ks, void *stream, int stream_size)
 {
     int offset = 0, campo_size;
 
-    /* PID */
     void *raw = km_leer_campo(stream, stream_size, &offset, &campo_size);
     if (!raw) { log_error(g_logger, "CREATE_PROCESS: error leyendo PID"); return; }
     int32_t pid; memcpy(&pid, raw, sizeof(int32_t)); free(raw);
 
-    /* Prioridad */
     raw = km_leer_campo(stream, stream_size, &offset, &campo_size);
     if (!raw) { log_error(g_logger, "CREATE_PROCESS: error leyendo prioridad"); return; }
     int32_t prioridad; memcpy(&prioridad, raw, sizeof(int32_t)); free(raw);
 
-    /* Nombre del script */
     raw = km_leer_campo(stream, stream_size, &offset, &campo_size);
     if (!raw) { log_error(g_logger, "CREATE_PROCESS: error leyendo nombre script"); return; }
     char *nombre = malloc(campo_size + 1);
@@ -164,31 +162,34 @@ void km_procesar_crear_proceso(int fd_ks, void *stream, int stream_size)
     nombre[campo_size] = '\0';
     free(raw);
 
-    /* Armar path completo */
-    char *base = config_get_string_value(g_config, "SCRIPTS_BASEPATH");
-    char  path[1024];
-    snprintf(path, sizeof(path), "%s/%s", base, nombre);
-    free(base);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", g_scripts_basepath, nombre);
 
-    /* Contar instrucciones abriendo el archivo */
-    int n_instrucciones = km_contar_instrucciones(path);
-
-    /* Logs obligatorios del enunciado */
-    log_info(g_logger, "## PID: %d - Proceso Creado", pid);
     log_info(g_logger, "## PID: %d - Script: %s", pid, nombre);
     log_info(g_logger, "## PID: %d - Path completo: %s", pid, path);
     log_info(g_logger, "## PID: %d - Prioridad: %d", pid, prioridad);
 
+    /* Verificar existencia ANTES de responder */
+    FILE *test = fopen(path, "r");
+    if (!test) {
+        log_error(g_logger, "## PID: %d - Script '%s' no encontrado en '%s' — respondiendo ERROR",
+                  pid, nombre, path);
+        free(nombre);
+        enviar_int32(fd_ks, OP_ERROR);   /* ← KS sabrá que falló */
+        return;
+    }
+    fclose(test);
+
+    int n_instrucciones = km_contar_instrucciones(path);
+    log_info(g_logger, "## PID: %d - Proceso Creado", pid);
     if (n_instrucciones >= 0)
         log_info(g_logger, "## PID: %d - Instrucciones: %d lineas", pid, n_instrucciones);
 
     free(nombre);
 
-    /* Cargar instrucciones en memoria para fetch posterior */
     if (!km_cargar_instrucciones(pid, path))
         log_error(g_logger, "Error cargando instrucciones para PID %d", pid);
 
-    /* Responder OK al KS */
     enviar_int32(fd_ks, OP_OK);
 }
 
@@ -499,6 +500,29 @@ int main(int argc, char *argv[])
         log_destroy(g_logger);
         return 1;
     }
+
+    /* ===== LECTURA Y DISPLAY DE CONFIGURACIÓN ===== */
+    int   km_puerto       = config_get_int_value(g_config,    "PUERTO_ESCUCHA");
+    char *km_scripts_path = config_get_string_value(g_config, "SCRIPTS_BASEPATH");
+    char *km_alloc_strat  = config_get_string_value(g_config, "ALLOCATION_STRATEGY");
+    int   km_instr_delay  = config_get_int_value(g_config,    "INSTRUCTION_DELAY");
+    int   km_seg_max      = config_get_int_value(g_config,    "SEGMENT_MAX_SIZE");
+    int   km_compact_delay= config_get_int_value(g_config,    "COMPACTION_DELAY");
+
+    /* Guardar basepath en global ANTES de cualquier free */
+    snprintf(g_scripts_basepath, sizeof(g_scripts_basepath), "%s", km_scripts_path);
+
+
+    printf("\n========== CONFIGURACIÓN DEL KERNEL MEMORY ==========\n");
+    printf("Puerto de escucha          : %d\n",  km_puerto);
+    printf("Scripts base path          : %s\n",  km_scripts_path);
+    printf("Estrategia de asignación   : %s\n",  km_alloc_strat);
+    printf("Instruction delay (ms)     : %d\n",  km_instr_delay);
+    printf("Segment max size           : %d\n",  km_seg_max);
+    printf("Compaction delay (ms)      : %d\n",  km_compact_delay);
+    printf("=====================================================\n\n");
+
+    /* ================================================ */
 
     inicializar_semaforos();
 

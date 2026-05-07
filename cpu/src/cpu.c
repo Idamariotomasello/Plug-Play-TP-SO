@@ -325,39 +325,127 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
     }
     /* Instrucciones de memoria */
     else if (!strcmp(op, "MOV_IN")) {
-        uint32_t buf = 0;
-        if (modo_test_sin_memoria) {
-            log_info(logger, "PID: %d - MOV_IN en modo test sin memoria; se usa valor 0", ctx->pid);
-        } else {
-            /* Codigo real para entrega con memoria completa. */
-            cpu_leer_memoria(ctx->pid, ctx->regs.SI, sizeof(uint32_t), &buf);
+    uint32_t buf = 0;
+
+    int32_t seg, despl;
+    cpu_mmu_traducir(ctx->regs.SI, &seg, &despl);
+    log_info(logger, "## PID: %d - MOV_IN: SI=%u → MMU: seg=%d, despl=%d → dir_fisica=%d",
+             ctx->pid, ctx->regs.SI, seg, despl, despl);
+
+    if (!modo_test_sin_memoria) {
+        if (despl + (int32_t)sizeof(uint32_t) > g_segment_max_size) {
+            log_error(logger, "## PID: %d - MOV_IN SEG_FAULT: despl(%d)+4 > seg_max(%d)",
+                      ctx->pid, despl, g_segment_max_size);
+            *motivo = MOTIVO_SEG_FAULT;
+            return false;
         }
-        cpu_escribir_registro(&ctx->regs, a1, buf);
-        log_info(logger, "PID: %d - Acción: LEER - Dirección Física: %d - Valor: %u",
-                 ctx->pid, ctx->regs.SI, buf);
+        cpu_leer_memoria(ctx->pid, ctx->regs.SI, sizeof(uint32_t), &buf);
+    }
+    cpu_escribir_registro(&ctx->regs, a1, buf);
+    log_info(logger, "## PID: %d - MOV_IN: leído valor=%u → guardado en %s", ctx->pid, buf, a1);
     }
     else if (!strcmp(op, "MOV_OUT")) {
         uint32_t val = cpu_leer_registro(&ctx->regs, a1);
-        if (modo_test_sin_memoria) {
-            log_info(logger, "PID: %d - MOV_OUT en modo test sin memoria; no se escribe Memory Stick", ctx->pid);
-        } else {
-            /* Codigo real para entrega con memoria completa. */
+
+        int32_t seg, despl;
+        cpu_mmu_traducir(ctx->regs.DI, &seg, &despl);
+        log_info(logger, "## PID: %d - MOV_OUT: DI=%u → MMU: seg=%d, despl=%d → dir_fisica=%d, valor=%u",
+                ctx->pid, ctx->regs.DI, seg, despl, despl, val);
+
+        if (!modo_test_sin_memoria) {
+            if (despl + (int32_t)sizeof(uint32_t) > g_segment_max_size) {
+                log_error(logger, "## PID: %d - MOV_OUT SEG_FAULT: despl(%d)+4 > seg_max(%d)",
+                        ctx->pid, despl, g_segment_max_size);
+                *motivo = MOTIVO_SEG_FAULT;
+                return false;
+            }
             cpu_escribir_memoria(ctx->pid, ctx->regs.DI, sizeof(uint32_t), &val);
         }
-        log_info(logger, "PID: %d - Acción: ESCRIBIR - Dirección Física: %d - Valor: %u",
-                 ctx->pid, ctx->regs.DI, val);
+        log_info(logger, "## PID: %d - MOV_OUT: valor=%u escrito en dir_fisica=%d", ctx->pid, val, despl);
     }
     else if (!strcmp(op, "COPY_MEM")) {
         int32_t tam = (int32_t)cpu_leer_registro(&ctx->regs, a1);
-        if (modo_test_sin_memoria) {
-            log_info(logger, "PID: %d - COPY_MEM en modo test sin memoria; tamanio: %d", ctx->pid, tam);
-        } else {
-            /* Codigo real para entrega con memoria completa. */
-            void *buf = malloc(tam);
-            cpu_leer_memoria(ctx->pid, ctx->regs.SI, tam, buf);
-            cpu_escribir_memoria(ctx->pid, ctx->regs.DI, tam, buf);
-            free(buf);
+
+        /* Log del registro de tamaño */
+        log_info(logger, "## PID: %d - COPY_MEM: registro tamaño=%s, valor=%d bytes",
+                ctx->pid, a1, tam);
+        log_info(logger, "## PID: %d - COPY_MEM: SI (origen lógico)=%u, DI (destino lógico)=%u",
+                ctx->pid, ctx->regs.SI, ctx->regs.DI);
+
+        if (tam <= 0) {
+            log_error(logger, "COPY_MEM: tamaño inválido (%d)", tam);
+            *motivo = MOTIVO_ERROR;
+            return false;
         }
+
+        /* MMU origen */
+        int32_t seg_src, despl_src;
+        cpu_mmu_traducir(ctx->regs.SI, &seg_src, &despl_src);
+        log_info(logger, "## PID: %d - MMU origen: dir_logica=%u → seg=%d, despl=%d (seg_max=%d)",
+                ctx->pid, ctx->regs.SI, seg_src, despl_src, g_segment_max_size);
+        log_info(logger, "## PID: %d - MMU origen: dir_fisica=%d",
+                ctx->pid, despl_src);
+
+        /* MMU destino */
+        int32_t seg_dst, despl_dst;
+        cpu_mmu_traducir(ctx->regs.DI, &seg_dst, &despl_dst);
+        log_info(logger, "## PID: %d - MMU destino: dir_logica=%u → seg=%d, despl=%d (seg_max=%d)",
+                ctx->pid, ctx->regs.DI, seg_dst, despl_dst, g_segment_max_size);
+        log_info(logger, "## PID: %d - MMU destino: dir_fisica=%d",
+                ctx->pid, despl_dst);
+
+        /* Verificar que no se salga del segmento */
+        if (despl_src + tam > g_segment_max_size) {
+            log_error(logger, "## PID: %d - COPY_MEM SEG_FAULT: origen despl(%d)+tam(%d) > seg_max(%d)",
+                    ctx->pid, despl_src, tam, g_segment_max_size);
+            *motivo = MOTIVO_SEG_FAULT;
+            return false;
+        }
+        if (despl_dst + tam > g_segment_max_size) {
+            log_error(logger, "## PID: %d - COPY_MEM SEG_FAULT: destino despl(%d)+tam(%d) > seg_max(%d)",
+                    ctx->pid, despl_dst, tam, g_segment_max_size);
+            *motivo = MOTIVO_SEG_FAULT;
+            return false;
+        }
+
+        if (fd_memory_stick == -1) {
+            log_error(logger, "COPY_MEM: Memory Stick no conectado");
+            *motivo = MOTIVO_ERROR;
+            return false;
+        }
+
+        void *buf = malloc(tam);
+        if (!buf) {
+            log_error(logger, "COPY_MEM: malloc falló para %d bytes", tam);
+            *motivo = MOTIVO_ERROR;
+            return false;
+        }
+
+        log_info(logger, "## PID: %d - COPY_MEM: leyendo %d bytes desde dir_fisica=%d",
+                ctx->pid, tam, despl_src);
+
+        if (!cpu_leer_memoria(ctx->pid, ctx->regs.SI, tam, buf)) {
+            log_error(logger, "COPY_MEM: fallo lectura desde SI=%u (dir_fisica=%d)",
+                    ctx->regs.SI, despl_src);
+            free(buf);
+            *motivo = MOTIVO_SEG_FAULT;
+            return false;
+        }
+
+        log_info(logger, "## PID: %d - COPY_MEM: escribiendo %d bytes en dir_fisica=%d",
+                ctx->pid, tam, despl_dst);
+
+        if (!cpu_escribir_memoria(ctx->pid, ctx->regs.DI, tam, buf)) {
+            log_error(logger, "COPY_MEM: fallo escritura en DI=%u (dir_fisica=%d)",
+                    ctx->regs.DI, despl_dst);
+            free(buf);
+            *motivo = MOTIVO_SEG_FAULT;
+            return false;
+        }
+
+        log_info(logger, "## PID: %d - COPY_MEM: completado — %d bytes de dir_fisica=%d a dir_fisica=%d",
+                ctx->pid, tam, despl_src, despl_dst);
+        free(buf);
     }
     /* Syscalls */
     else if (!strcmp(op, "EXIT")) {
@@ -610,13 +698,19 @@ int main(int argc, char *argv[])
     log_info(logger, "Conectando a Memory Stick %s:%d...", ip_ms, puerto_ms);
     fd_memory_stick = conectar_a_servidor(logger, ip_ms, puerto_ms);
     free(ip_ms);
-    if (fd_memory_stick == -1)
-    {
-        log_warning(logger, "No se pudo conectar al Memory Stick — operaciones de memoria no disponibles");
-        /* No es fatal en checkpoint 1 */
+    if (fd_memory_stick == -1) {
+        log_warning(logger, "No se pudo conectar al Memory Stick");
+    } else {
+        /* Handshake con MS — igual que con KM */
+        if (!enviar_handshake(logger, fd_memory_stick, TIPO_CPU)) {
+            log_error(logger, "Handshake fallo con Memory Stick");
+            close(fd_memory_stick);
+            fd_memory_stick = -1;
+        } else {
+            enviar_int32(fd_memory_stick, g_id_cpu);
+            log_info(logger, "## CPU %d conectada al Memory Stick", g_id_cpu);
+        }
     }
-    else
-        log_info(logger, "## CPU %d conectada al Memory Stick", g_id_cpu);
  
     pthread_t hilo_kernel_scheduler_interrupt;
     if (usar_doble_conexion_kernel_scheduler)
