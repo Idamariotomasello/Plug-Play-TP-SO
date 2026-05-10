@@ -163,7 +163,13 @@ void km_procesar_crear_proceso(int fd_ks, void *stream, int stream_size)
     free(raw);
 
     char path[1024];
-    snprintf(path, sizeof(path), "%s/%s", g_scripts_basepath, nombre);
+    int n = snprintf(path, sizeof(path), "%s/%s",
+                 g_scripts_basepath, nombre);
+
+    if (n < 0 || n >= sizeof(path)) {
+        fprintf(stderr, "Ruta demasiado larga\n");
+        return;
+    };
 
     log_info(g_logger, "## PID: %d - Script: %s", pid, nombre);
     log_info(g_logger, "## PID: %d - Path completo: %s", pid, path);
@@ -191,6 +197,75 @@ void km_procesar_crear_proceso(int fd_ks, void *stream, int stream_size)
         log_error(g_logger, "Error cargando instrucciones para PID %d", pid);
 
     enviar_int32(fd_ks, OP_OK);
+}
+
+void km_crear_segmento(int fd_ks, int32_t pid, int32_t seg_id, int32_t tam_seg)
+{
+    log_info(g_logger, "## PID: %d - Crear segmento %d de %d bytes",
+             pid, seg_id, tam_seg);
+
+    /* Estrategia simple: llenar MSs en orden hasta cubrir tam_seg */
+    t_segmento nuevo_seg;
+    memset(&nuevo_seg, 0, sizeof(nuevo_seg));
+    nuevo_seg.activo   = true;
+    nuevo_seg.seg_id   = seg_id;
+    nuevo_seg.limite   = tam_seg;
+    nuevo_seg.n_trozos = 0;
+
+    int32_t bytes_restantes = tam_seg;
+    int32_t offset_seg      = 0;
+
+    pthread_mutex_lock(&mutex_ms_lista);
+
+    for (int i = 0; i < g_ms_count && bytes_restantes > 0; i++) {
+        if (!g_ms_lista[i].activo) continue;
+
+        /* Espacio libre simple: al final del MS (sin compactación) */
+        /* TODO: implementar estrategia BEST/WORST/FIRST según config */
+        int32_t espacio = g_ms_lista[i].tamanio; /* simplificado */
+        int32_t asignar = (bytes_restantes < espacio) ? bytes_restantes : espacio;
+
+        t_trozo_segmento *trozo = &nuevo_seg.trozos[nuevo_seg.n_trozos++];
+        trozo->ms_id        = i;
+        trozo->dir_fisica_ms = 0;  /* TODO: llevar cuenta de espacio usado por MS */
+        trozo->offset_seg   = offset_seg;
+        trozo->tamanio      = asignar;
+
+        bytes_restantes -= asignar;
+        offset_seg      += asignar;
+    }
+
+    pthread_mutex_unlock(&mutex_ms_lista);
+
+    if (bytes_restantes > 0) {
+        log_error(g_logger, "## PID: %d - Sin espacio para segmento %d (%d bytes faltantes)",
+                  pid, seg_id, bytes_restantes);
+        enviar_int32(fd_ks, OP_ERROR);
+        return;
+    }
+
+    /* Guardar en la tabla del proceso */
+    pthread_mutex_lock(&mutex_procesos);
+    for (int i = 0; i < KM_MAX_PROCESOS; i++) {
+        if (g_procesos[i].activo && g_procesos[i].pid == pid) {
+            g_procesos[i].segmentos[g_procesos[i].n_segmentos++] = nuevo_seg;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&mutex_procesos);
+
+    /* Responder con la tabla de trozos */
+    enviar_int32(fd_ks, OP_OK);
+    enviar_int32(fd_ks, nuevo_seg.n_trozos);
+    for (int i = 0; i < nuevo_seg.n_trozos; i++) {
+        enviar_int32(fd_ks, nuevo_seg.trozos[i].ms_id);
+        enviar_int32(fd_ks, nuevo_seg.trozos[i].dir_fisica_ms);
+        enviar_int32(fd_ks, nuevo_seg.trozos[i].offset_seg);
+        enviar_int32(fd_ks, nuevo_seg.trozos[i].tamanio);
+    }
+
+    log_info(g_logger, "## PID: %d - Segmento %d creado en %d trozo(s)",
+             pid, seg_id, nuevo_seg.n_trozos);
 }
 
 void km_iniciar_servidor(t_log *logger, int puerto)
@@ -247,25 +322,50 @@ void km_atender_ks(t_log *logger, int fd_ks)
 {
     log_info(logger, "## Kernel Scheduler Conectado - FD del socket: %d", fd_ks);
 
+    /* Guardar fd para poder notificar asíncronamente */
+    pthread_mutex_lock(&mutex_fd_ks);
+    fd_ks_global = fd_ks;
+    pthread_mutex_unlock(&mutex_fd_ks);
+
     int32_t cod_op;
     while (recibir_int32(fd_ks, &cod_op)) {
-        log_info(logger, "KS solicita operación: %d", cod_op);
-        
         switch (cod_op) {
             case OP_CREAR_PROCESO: {
-                void *stream = NULL;
-                int size = 0;
+                void *stream = NULL; int size = 0;
                 if (km_recibir_cuerpo_paquete(fd_ks, &stream, &size)) {
                     km_procesar_crear_proceso(fd_ks, stream, size);
                     free(stream);
                 }
                 break;
             }
+            case OP_CREAR_SEGMENTO: {
+                /* KS pide asignar un segmento para un proceso
+                 * Protocolo: pid (int32) | seg_id (int32) | tamanio (int32)
+                 * Responde:  OP_OK | n_trozos (int32) | [ms_id, dir_fisica, offset, tam] x n
+                 *         ó OP_ERROR si no hay espacio */
+                int32_t pid, seg_id, tam_seg;
+                recibir_int32(fd_ks, &pid);
+                recibir_int32(fd_ks, &seg_id);
+                recibir_int32(fd_ks, &tam_seg);
+                km_crear_segmento(fd_ks, pid, seg_id, tam_seg);
+                break;
+            }
+            case OP_ELIMINAR_SEGMENTO: {
+                int32_t pid, seg_id;
+                recibir_int32(fd_ks, &pid);
+                recibir_int32(fd_ks, &seg_id);
+                km_eliminar_segmento(fd_ks, pid, seg_id);
+                break;
+            }
             default:
-                log_info(logger, "Operación KS desconocida: %d", cod_op);
+                log_warning(logger, "Operación KS desconocida: %d", cod_op);
                 break;
         }
     }
+
+    pthread_mutex_lock(&mutex_fd_ks);
+    fd_ks_global = -1;
+    pthread_mutex_unlock(&mutex_fd_ks);
 
     log_warning(logger, "Kernel Scheduler desconectado (fd=%d)", fd_ks);
     close(fd_ks);
@@ -353,29 +453,29 @@ void km_atender_cpu(t_log *logger, int fd_cpu)
                 int32_t pid;
                 if (!recibir_int32(fd_cpu, &pid)) goto cpu_desconectada;
 
-                log_info(logger, "CPU %d — GET_CONTEXTO PID=%d", id_cpu, pid);
-
-                /* Buscar contexto guardado del proceso */
-                t_registros ctx_regs;
-                memset(&ctx_regs, 0, sizeof(t_registros));
+                t_registros regs;
+                int32_t     n_seg = 0;
+                t_segmento  segs[MAX_SEGMENTOS];
+                memset(&regs, 0, sizeof(regs));
 
                 pthread_mutex_lock(&mutex_procesos);
                 for (int i = 0; i < KM_MAX_PROCESOS; i++) {
                     if (g_procesos[i].activo && g_procesos[i].pid == pid) {
-                        memcpy(&ctx_regs, &g_procesos[i].registros, sizeof(t_registros));
+                        memcpy(&regs,  &g_procesos[i].registros,  sizeof(t_registros));
+                        n_seg = g_procesos[i].n_segmentos;
+                        memcpy(segs, g_procesos[i].segmentos, n_seg * sizeof(t_segmento));
                         break;
                     }
                 }
                 pthread_mutex_unlock(&mutex_procesos);
 
-                log_info(logger, "GET_CONTEXTO: enviando contexto de %zu bytes para PID=%d (PC=%u)",
-                        sizeof(t_registros), pid, ctx_regs.PC);
+                log_info(logger, "GET_CONTEXTO: PID=%d PC=%u segmentos=%d", pid, regs.PC, n_seg);
 
                 if (!enviar_int32(fd_cpu, OP_OK)) goto cpu_desconectada;
-                if (send(fd_cpu, &ctx_regs, sizeof(t_registros), MSG_NOSIGNAL) != (int)sizeof(t_registros))
-                    goto cpu_desconectada;
-
-                log_info(logger, "GET_CONTEXTO completado (%zu bytes enviados)", sizeof(t_registros));
+                send(fd_cpu, &regs,  sizeof(t_registros), MSG_NOSIGNAL);
+                enviar_int32(fd_cpu, n_seg);
+                if (n_seg > 0)
+                    send(fd_cpu, segs, n_seg * sizeof(t_segmento), MSG_NOSIGNAL);
                 break;
             }
 
@@ -383,24 +483,28 @@ void km_atender_cpu(t_log *logger, int fd_cpu)
                 int32_t pid;
                 if (!recibir_int32(fd_cpu, &pid)) goto cpu_desconectada;
 
-                t_registros ctx_regs;
-                if (recv(fd_cpu, &ctx_regs, sizeof(t_registros), MSG_WAITALL) != (int)sizeof(t_registros))
-                    goto cpu_desconectada;
+                t_registros regs;
+                int32_t     n_seg;
+                t_segmento  segs[MAX_SEGMENTOS];
 
-                /* Persistir el contexto */
+                recv(fd_cpu, &regs,  sizeof(t_registros), MSG_WAITALL);
+                recibir_int32(fd_cpu, &n_seg);
+                if (n_seg > 0)
+                    recv(fd_cpu, segs, n_seg * sizeof(t_segmento), MSG_WAITALL);
+
                 pthread_mutex_lock(&mutex_procesos);
                 for (int i = 0; i < KM_MAX_PROCESOS; i++) {
                     if (g_procesos[i].activo && g_procesos[i].pid == pid) {
-                        memcpy(&g_procesos[i].registros, &ctx_regs, sizeof(t_registros));
+                        memcpy(&g_procesos[i].registros, &regs, sizeof(t_registros));
+                        g_procesos[i].n_segmentos = n_seg;
+                        memcpy(g_procesos[i].segmentos, segs, n_seg * sizeof(t_segmento));
                         break;
                     }
                 }
                 pthread_mutex_unlock(&mutex_procesos);
 
-                log_info(logger, "CPU %d — SET_CONTEXTO PID=%d (PC guardado: %u)", id_cpu, pid, ctx_regs.PC);
-
-                if (!enviar_int32(fd_cpu, OP_OK)) goto cpu_desconectada;
-                log_info(logger, "SET_CONTEXTO completado");
+                log_info(logger, "SET_CONTEXTO: PID=%d PC=%u segmentos=%d", pid, regs.PC, n_seg);
+                enviar_int32(fd_cpu, OP_OK);
                 break;
             }
 
@@ -426,16 +530,55 @@ void km_atender_ms(t_log *logger, int fd_ms)
         return;
     }
 
+    pthread_mutex_lock(&mutex_ms_lista);
+    int idx = g_ms_count;
+    if (idx < MAX_MS) {
+        g_ms_lista[idx].fd          = fd_ms;
+        g_ms_lista[idx].tamanio     = tamanio;
+        g_ms_lista[idx].base_global = g_memoria_total;
+        g_ms_lista[idx].activo      = true;
+        g_ms_count++;
+        g_memoria_total += tamanio;
+    }
+    pthread_mutex_unlock(&mutex_ms_lista);
+
     __atomic_add_fetch(&g_ms_conectados, 1, __ATOMIC_SEQ_CST);
-    log_info(logger, "## Memory Stick de %d bytes Conectada (fd=%d) — total: %d",
-             tamanio, fd_ms, g_ms_conectados);
+    log_info(logger,
+             "## Memory Stick %d de %d bytes conectada (fd=%d) — "
+             "base_global=%d — memoria_total=%d bytes",
+             idx, tamanio, fd_ms,
+             g_ms_lista[idx].base_global, g_memoria_total);
+
+    /* Notificar al KS que hay más memoria disponible */
+    pthread_mutex_lock(&mutex_fd_ks);
+    if (fd_ks_global != -1) {
+        log_info(logger, "## Notificando KS: OP_NUEVA_MEMORIA (%d bytes totales)",
+                 g_memoria_total);
+        enviar_int32(fd_ks_global, OP_NUEVA_MEMORIA);
+        enviar_int32(fd_ks_global, g_memoria_total);
+    }
+    pthread_mutex_unlock(&mutex_fd_ks);
 
     if (g_ms_conectados == 1)
         sem_post(&g_sem_listo);
 
+    /* Monitorear desconexión */
     char probe;
-    if (recv(fd_ms, &probe, 1, MSG_WAITALL) <= 0)
-        log_info(logger, "Memory Stick desconectado");
+    if (recv(fd_ms, &probe, 1, MSG_WAITALL) <= 0) {
+        log_warning(logger, "## Memory Stick %d desconectada — notificando KS: MEMORIA_CORRUPTA", idx);
+
+        pthread_mutex_lock(&mutex_ms_lista);
+        g_ms_lista[idx].activo  = false;
+        g_memoria_total        -= tamanio;
+        pthread_mutex_unlock(&mutex_ms_lista);
+
+        /* Notificar al KS corrupción */
+        pthread_mutex_lock(&mutex_fd_ks);
+        if (fd_ks_global != -1) {
+            enviar_int32(fd_ks_global, OP_MEMORIA_CORRUPTA);
+        }
+        pthread_mutex_unlock(&mutex_fd_ks);
+    }
 
     __atomic_sub_fetch(&g_ms_conectados, 1, __ATOMIC_SEQ_CST);
     close(fd_ms);

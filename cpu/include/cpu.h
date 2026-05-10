@@ -5,15 +5,6 @@
 
 
  
-/* =========================================================
- * Contexto de ejecución — lo que viaja entre KS/KM y CPU
- * ========================================================= */
-typedef struct {
-    int32_t    pid;
-    t_registros regs;
-} t_contexto;
- 
-
 typedef enum {
     SYSCALL_NINGUNA = 0,
     SYSCALL_SLEEP,

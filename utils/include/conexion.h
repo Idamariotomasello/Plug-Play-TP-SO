@@ -17,6 +17,7 @@
 #include <commons/config.h>
 #include <semaphore.h>
 #include <math.h>
+#include <limits.h>
 
 /**
 * @brief Imprime un saludo por consola
@@ -25,6 +26,8 @@
 */
 void saludar(char* quien);
 
+#define MAX_SEGMENTOS   64
+#define MAX_MS          16   /* máximo de Memory Sticks simultáneos */
 
 
 extern t_log *logger;
@@ -35,6 +38,9 @@ extern pthread_mutex_t mutex_procesos;
 extern pthread_mutex_t mutex_irq;
 extern pthread_mutex_t mutex_km;
 extern pthread_mutex_t  g_mutex_cola_ready;
+extern pthread_mutex_t mutex_fd_ks;
+extern pthread_mutex_t mutex_ms_lista;
+extern pthread_mutex_t mutex_interrupcion_pendiente;
 
 extern sem_t g_sem_listo;
 
@@ -83,6 +89,7 @@ typedef enum
     OP_SET_CONTEXTO = 302,
     OP_CREAR_SEGMENTO = 303,
     OP_ELIMINAR_SEGMENTO = 304,
+    OP_GET_MS_LIST = 305,
     
     //Operaciones KM->KS
     OP_NUEVA_MEMORIA = 500,
@@ -150,6 +157,37 @@ typedef enum {
     MOTIVO_EXIT = 4,
     MOTIVO_SEG_FAULT = 5
 } e_motivo_retorno;
+
+typedef struct {
+    int32_t  ms_id;          /* índice del MS donde está este trozo */
+    int32_t  dir_fisica_ms;  /* dirección física dentro de ese MS   */
+    int32_t  offset_seg;     /* byte de inicio dentro del segmento  */
+    int32_t  tamanio;        /* bytes de este trozo en ese MS       */
+} t_trozo_segmento;
+
+typedef struct {
+    bool    activo;
+    int32_t seg_id;
+    int32_t base;            /* base lógica del segmento (= seg_id * SEGMENT_MAX_SIZE) */
+    int32_t limite;          /* tamaño total del segmento en bytes  */
+    int32_t n_trozos;
+    t_trozo_segmento trozos[MAX_MS]; /* cómo está distribuido entre MSs */
+} t_segmento;
+
+/* Contexto extendido con tabla de segmentos */
+typedef struct {
+    int32_t     pid;
+    t_registros regs;
+    int32_t     n_segmentos;
+    t_segmento  segmentos[MAX_SEGMENTOS];
+} t_contexto;
+
+/* Info de un MS conocido por la CPU */
+typedef struct {
+    int     fd;
+    int32_t tamanio;
+    int32_t base_global;  /* offset global: suma de tamaños de MSs anteriores */
+} t_ms_info;
 
 typedef struct s_pcb {
     bool activo;                 // para marcar PCB como eliminado

@@ -7,12 +7,22 @@
 #define KM_MAX_INSTRUCCIONES 1024
  
 typedef struct {
+    bool     activo;
     int32_t  pid;
     char   **instrucciones;
     int      n_instrucciones;
-    bool     activo;
-    t_registros registros; 
+    t_registros registros;
+    int32_t     n_segmentos;
+    t_segmento  segmentos[MAX_SEGMENTOS];
 } t_proceso_km;
+
+/* Lista de Memory Sticks conectados */
+typedef struct {
+    int     fd;
+    int32_t tamanio;
+    int32_t base_global;   /* suma de tamaños anteriores */
+    bool    activo;
+} t_ms_km;
 
 typedef struct
 {
@@ -20,6 +30,12 @@ typedef struct
     int      fd_cliente;
     int32_t  tipo;
 } t_km_hilo_arg;
+
+t_ms_km  g_ms_lista[MAX_MS];
+int      g_ms_count      = 0;
+int32_t  g_memoria_total = 0;
+int fd_ks_global = -1;   /* para notificar al KS */
+
 
 void km_init_procesos(void);
 bool km_cargar_instrucciones(int32_t pid, const char *path);

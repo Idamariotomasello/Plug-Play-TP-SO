@@ -10,9 +10,13 @@ int fd_kernel_scheduler_dispatch = -1;
 int fd_kernel_scheduler_interrupt = -1;
 int fd_kernel_memory = -1;
 int fd_memory_stick = -1;
+
+int     g_ms_fds[MAX_MS];
+int32_t g_ms_tamanios[MAX_MS];
+int     g_ms_count_cpu = 0;
  
 t_interrupcion interrupcion_pendiente = { .activa = false, .motivo = 0 };
-pthread_mutex_t mutex_interrupcion_pendiente = PTHREAD_MUTEX_INITIALIZER;
+
 
 bool modo_test_sin_memoria = false;
 bool usar_doble_conexion_kernel_scheduler = false;
@@ -96,49 +100,147 @@ void cpu_mmu_traducir(uint32_t dir_logica,
     *despl   = (int32_t)(dir_logica % (uint32_t)g_segment_max_size);
 }
 
-bool cpu_leer_memoria(int32_t pid, uint32_t dir_logica,
-                              int32_t tamanio, void *dest)
+
+/* Busca el segmento en la tabla del contexto */
+static t_segmento *cpu_buscar_segmento(t_contexto *ctx, int32_t num_seg)
 {
-    int32_t seg, despl;
-    cpu_mmu_traducir(dir_logica, &seg, &despl);
-    int32_t dir_fisica = despl;
-
-    log_info(logger, "PID: %d - Acción: LEER - Dirección Física: %d",
-             pid, dir_fisica);
- 
-    enviar_int32(fd_memory_stick, OP_LEER_MS);
-    enviar_int32(fd_memory_stick, dir_fisica);
-    enviar_int32(fd_memory_stick, tamanio);
- 
-    int32_t resp;
-    if (!recibir_int32(fd_memory_stick, &resp) || resp != OP_OK)
-        return false;
-
-    int32_t tam_recv;
-    if (!recibir_int32(fd_memory_stick, &tam_recv))
-        return false;
- 
-    return recv(fd_memory_stick, dest, tam_recv, MSG_WAITALL) == tam_recv;
+    for (int i = 0; i < ctx->n_segmentos; i++)
+        if (ctx->segmentos[i].activo && ctx->segmentos[i].seg_id == num_seg)
+            return &ctx->segmentos[i];
+    return NULL;
 }
 
-bool cpu_escribir_memoria(int32_t pid, uint32_t dir_logica,
-                                  int32_t tamanio, void *src)
+bool cpu_leer_memoria(t_contexto *ctx, uint32_t dir_logica,
+                      int32_t tamanio, void *dest)
 {
-    int32_t seg, despl;
-    cpu_mmu_traducir(dir_logica, &seg, &despl);
-    int32_t dir_fisica = despl;
+    int32_t num_seg = (int32_t)floor((double)dir_logica / g_segment_max_size);
+    int32_t despl   = (int32_t)(dir_logica % (uint32_t)g_segment_max_size);
 
-    log_info(logger, "PID: %d - Acción: ESCRIBIR - Dirección Física: %d",
-             pid, dir_fisica);
- 
-    enviar_int32(fd_memory_stick, OP_ESCRIBIR_MS);
-    enviar_int32(fd_memory_stick, dir_fisica);
-    enviar_int32(fd_memory_stick, tamanio);
-    send(fd_memory_stick, src, tamanio, MSG_NOSIGNAL);
- 
-    int32_t resp;
-    return recibir_int32(fd_memory_stick, &resp) && resp == OP_OK;
+    t_segmento *seg = cpu_buscar_segmento(ctx, num_seg);
+    if (!seg) {
+        log_error(logger, "## PID: %d - SEG_FAULT: segmento %d no existe",
+                  ctx->pid, num_seg);
+        return false;
+    }
+
+    if (despl + tamanio > seg->limite) {
+        log_error(logger,
+                  "## PID: %d - SEG_FAULT: despl(%d)+tam(%d) > limite(%d) seg=%d",
+                  ctx->pid, despl, tamanio, seg->limite, num_seg);
+        return false;
+    }
+
+    log_info(logger,
+             "## PID: %d - LEER: dir_logica=%u → seg=%d despl=%d tam=%d",
+             ctx->pid, dir_logica, num_seg, despl, tamanio);
+
+    /* Recorrer trozos del segmento para cubrir [despl, despl+tamanio) */
+    int32_t leidos = 0;
+    for (int i = 0; i < seg->n_trozos && leidos < tamanio; i++) {
+        t_trozo_segmento *t = &seg->trozos[i];
+
+        /* ¿Este trozo cubre parte del rango que necesitamos? */
+        int32_t trozo_inicio = t->offset_seg;
+        int32_t trozo_fin    = t->offset_seg + t->tamanio;
+        int32_t rango_inicio = despl + leidos;
+        int32_t rango_fin    = despl + tamanio;
+
+        if (trozo_fin <= rango_inicio || trozo_inicio >= rango_fin)
+            continue;
+
+        int32_t desde_trozo = rango_inicio - trozo_inicio;
+        int32_t a_leer      = trozo_fin - rango_inicio;
+        if (rango_fin < trozo_fin)
+            a_leer = rango_fin - rango_inicio;
+
+        int32_t dir_fisica = t->dir_fisica_ms + desde_trozo;
+        int     fd_ms      = g_ms_fds[t->ms_id];
+
+        log_info(logger,
+                 "## PID: %d - LEER trozo: MS=%d dir_fisica=%d bytes=%d",
+                 ctx->pid, t->ms_id, dir_fisica, a_leer);
+
+        enviar_int32(fd_ms, OP_LEER_MS);
+        enviar_int32(fd_ms, dir_fisica);
+        enviar_int32(fd_ms, a_leer);
+
+        int32_t resp, tam_recv;
+        if (!recibir_int32(fd_ms, &resp) || resp != OP_OK) return false;
+        if (!recibir_int32(fd_ms, &tam_recv)) return false;
+        if (recv(fd_ms, (char*)dest + leidos, tam_recv, MSG_WAITALL) != tam_recv)
+            return false;
+
+        leidos += a_leer;
+    }
+
+    log_info(logger, "## PID: %d - LEER completado (%d bytes)", ctx->pid, leidos);
+    return leidos == tamanio;
 }
+
+bool cpu_escribir_memoria(t_contexto *ctx, uint32_t dir_logica,
+                          int32_t tamanio, void *src)
+{
+    int32_t num_seg = (int32_t)floor((double)dir_logica / g_segment_max_size);
+    int32_t despl   = (int32_t)(dir_logica % (uint32_t)g_segment_max_size);
+
+    t_segmento *seg = cpu_buscar_segmento(ctx, num_seg);
+    if (!seg) {
+        log_error(logger, "## PID: %d - SEG_FAULT: segmento %d no existe",
+                  ctx->pid, num_seg);
+        return false;
+    }
+
+    if (despl + tamanio > seg->limite) {
+        log_error(logger,
+                  "## PID: %d - SEG_FAULT: despl(%d)+tam(%d) > limite(%d) seg=%d",
+                  ctx->pid, despl, tamanio, seg->limite, num_seg);
+        return false;
+    }
+
+    log_info(logger,
+             "## PID: %d - ESCRIBIR: dir_logica=%u → seg=%d despl=%d tam=%d",
+             ctx->pid, dir_logica, num_seg, despl, tamanio);
+
+    int32_t escritos = 0;
+    for (int i = 0; i < seg->n_trozos && escritos < tamanio; i++) {
+        t_trozo_segmento *t = &seg->trozos[i];
+
+        int32_t trozo_inicio = t->offset_seg;
+        int32_t trozo_fin    = t->offset_seg + t->tamanio;
+        int32_t rango_inicio = despl + escritos;
+        int32_t rango_fin    = despl + tamanio;
+
+        if (trozo_fin <= rango_inicio || trozo_inicio >= rango_fin)
+            continue;
+
+        int32_t desde_trozo = rango_inicio - trozo_inicio;
+        int32_t a_escribir  = trozo_fin - rango_inicio;
+        if (rango_fin < trozo_fin)
+            a_escribir = rango_fin - rango_inicio;
+
+        int32_t dir_fisica = t->dir_fisica_ms + desde_trozo;
+        int     fd_ms      = g_ms_fds[t->ms_id];
+
+        log_info(logger,
+                 "## PID: %d - ESCRIBIR trozo: MS=%d dir_fisica=%d bytes=%d",
+                 ctx->pid, t->ms_id, dir_fisica, a_escribir);
+
+        enviar_int32(fd_ms, OP_ESCRIBIR_MS);
+        enviar_int32(fd_ms, dir_fisica);
+        enviar_int32(fd_ms, a_escribir);
+        send(fd_ms, (char*)src + escritos, a_escribir, MSG_NOSIGNAL);
+
+        int32_t resp;
+        if (!recibir_int32(fd_ms, &resp) || resp != OP_OK) return false;
+
+        escritos += a_escribir;
+    }
+
+    log_info(logger, "## PID: %d - ESCRIBIR completado (%d bytes)", ctx->pid, escritos);
+    return escritos == tamanio;
+}
+
+
 
 void cpu_limpiar_syscall(t_syscall_pendiente *syscall)
 {
@@ -590,11 +692,15 @@ void cpu_ciclo_instruccion(t_contexto *ctx)
         pthread_mutex_unlock(&mutex_irq);
     }
  
-    /* ── Guardar contexto en KM y devolver PID al KS ── */
+    /* Al guardar contexto: */
     enviar_int32(fd_kernel_memory, OP_SET_CONTEXTO);
     enviar_int32(fd_kernel_memory, ctx->pid);
     send(fd_kernel_memory, &ctx->regs, sizeof(t_registros), MSG_NOSIGNAL);
- 
+    enviar_int32(fd_kernel_memory, ctx->n_segmentos);
+    if (ctx->n_segmentos > 0)
+        send(fd_kernel_memory, ctx->segmentos,
+            ctx->n_segmentos * sizeof(t_segmento), MSG_NOSIGNAL);
+
     int32_t ack;
     recibir_int32(fd_kernel_memory, &ack);
  
@@ -696,20 +802,37 @@ int main(int argc, char *argv[])
     int   puerto_ms = config_get_int_value(config, "PUERTO_MEMORY_STICK");
 
     log_info(logger, "Conectando a Memory Stick %s:%d...", ip_ms, puerto_ms);
-    fd_memory_stick = conectar_a_servidor(logger, ip_ms, puerto_ms);
-    free(ip_ms);
-    if (fd_memory_stick == -1) {
-        log_warning(logger, "No se pudo conectar al Memory Stick");
-    } else {
-        /* Handshake con MS — igual que con KM */
-        if (!enviar_handshake(logger, fd_memory_stick, TIPO_CPU)) {
-            log_error(logger, "Handshake fallo con Memory Stick");
-            close(fd_memory_stick);
-            fd_memory_stick = -1;
-        } else {
-            enviar_int32(fd_memory_stick, g_id_cpu);
-            log_info(logger, "## CPU %d conectada al Memory Stick", g_id_cpu);
-        }
+    /* Conectar a todos los Memory Sticks disponibles */
+    g_ms_count_cpu = 0;
+    memset(g_ms_fds,     -1, sizeof(g_ms_fds));
+    memset(g_ms_tamanios, 0, sizeof(g_ms_tamanios));
+
+    /* La CPU obtiene la lista de MSs del KM */
+    enviar_int32(fd_kernel_memory, OP_GET_MS_LIST);
+    int32_t n_ms;
+    recibir_int32(fd_kernel_memory, &n_ms);
+
+    for (int i = 0; i < n_ms; i++) {
+        char ip_ms[64];
+        int32_t puerto_ms, tamanio_ms, largo_ip;
+
+        recibir_int32(fd_kernel_memory, &largo_ip);
+        recv(fd_kernel_memory, ip_ms, largo_ip, MSG_WAITALL);
+        ip_ms[largo_ip] = '\0';
+        recibir_int32(fd_kernel_memory, &puerto_ms);
+        recibir_int32(fd_kernel_memory, &tamanio_ms);
+
+        int fd = conectar_a_servidor(logger, ip_ms, puerto_ms);
+        if (fd == -1) { log_warning(logger, "MS %d no disponible", i); continue; }
+
+        if (!enviar_handshake(logger, fd, TIPO_CPU)) { close(fd); continue; }
+        enviar_int32(fd, g_id_cpu);
+
+        g_ms_fds[i]      = fd;
+        g_ms_tamanios[i] = tamanio_ms;
+        g_ms_count_cpu++;
+        log_info(logger, "## CPU %d conectada a MS %d (%s:%d, %d bytes)",
+                g_id_cpu, i, ip_ms, puerto_ms, tamanio_ms);
     }
  
     pthread_t hilo_kernel_scheduler_interrupt;
@@ -735,29 +858,23 @@ int main(int argc, char *argv[])
     {
         log_info(logger, "## CPU %d recibio PID %d — solicitando contexto", g_id_cpu, pid);
  
-        /* Pedir contexto al KM */
+        /* En el loop principal de la CPU, al recibir un PID: */
         enviar_int32(fd_kernel_memory, OP_GET_CONTEXTO);
         enviar_int32(fd_kernel_memory, pid);
- 
+
         int32_t resp;
-        if (!recibir_int32(fd_kernel_memory, &resp) || resp != OP_OK)
-        {
-            log_error(logger, "No se pudo obtener contexto de PID %d", pid);
-            enviar_int32(fd_kernel_scheduler_dispatch, pid);
-            enviar_int32(fd_kernel_scheduler_dispatch, (int32_t)MOTIVO_SEG_FAULT);
-            continue;
-        }
+        recibir_int32(fd_kernel_memory, &resp);  /* OP_OK */
 
         t_contexto ctx;
         ctx.pid = pid;
-        if (recv(fd_kernel_memory, &ctx.regs, sizeof(t_registros), MSG_WAITALL)
-            != sizeof(t_registros))
-        {
-            log_error(logger, "Error recibiendo contexto de PID %d", pid);
-            continue;
-        }
+        recv(fd_kernel_memory, &ctx.regs,  sizeof(t_registros), MSG_WAITALL);
+        recibir_int32(fd_kernel_memory, &ctx.n_segmentos);
+        if (ctx.n_segmentos > 0)
+            recv(fd_kernel_memory, ctx.segmentos,
+                ctx.n_segmentos * sizeof(t_segmento), MSG_WAITALL);
 
-        log_info(logger, "## PID: %d — Contexto cargado (PC=%u)", pid, ctx.regs.PC);
+        log_info(logger, "## PID: %d — Contexto cargado (PC=%u, segs=%d)",
+                pid, ctx.regs.PC, ctx.n_segmentos);
 
         /* Ejecutar ciclo de instrucción */
         cpu_ciclo_instruccion(&ctx);
