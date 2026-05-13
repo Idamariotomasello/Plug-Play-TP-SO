@@ -8,7 +8,8 @@
 
 t_log    *logger          = NULL;
 t_config *config          = NULL;
-int       fd_kernel_memory = -1;
+int       fd_kernel_memory      = -1;   // socket síncrono
+
 
 /* Dispositivos IO */
 int             fd_io_sleep  = -1;
@@ -288,6 +289,75 @@ void ks_syscall_io(int32_t subtipo, int32_t pid, void *param, int32_t param_size
 }
 
 /* =========================================================
+ * ks_recibir_de_km
+ * Lee un int32 del socket KM descartando cualquier
+ * OP_NUEVA_MEMORIA que llegue antes de la respuesta real.
+ * DEBE llamarse con mutex_km_socket ya tomado.
+ * ========================================================= */
+bool ks_recibir_de_km(int32_t *out)
+{
+    while (recibir_int32(fd_kernel_memory, out)) {
+        if (*out == OP_NUEVA_MEMORIA) {
+            int32_t nueva_total;
+            recibir_int32(fd_kernel_memory, &nueva_total);
+            log_info(logger,
+                     "## KM — OP_NUEVA_MEMORIA (notif. inline): total=%d bytes",
+                     nueva_total);
+            continue;
+        }
+        if (*out == OP_MEMORIA_CORRUPTA) {
+            log_error(logger, "## KM — OP_MEMORIA_CORRUPTA — BSOD");
+            pthread_mutex_lock(&g_mutex_ks_pcbs);
+            for (int i = 0; i < KS_MAX_PROCESOS; i++)
+                if (g_ks_pcbs[i].activo && g_ks_pcbs[i].estado != ESTADO_EXIT)
+                    g_ks_pcbs[i].estado = ESTADO_EXIT;
+            pthread_mutex_unlock(&g_mutex_ks_pcbs);
+            exit(1);
+        }
+        return true;  /* es una respuesta real: OP_OK o OP_ERROR */
+    }
+    return false;  /* socket cerrado */
+}
+
+bool ks_crear_segmento(int32_t pid, int32_t seg_id, int32_t tamanio)
+{
+    log_info(logger, "## (%d) - MEM_ALLOC: solicitando segmento %d tam=%d al KM",
+             pid, seg_id, tamanio);
+
+    pthread_mutex_lock(&mutex_km_socket);
+
+    enviar_int32(fd_kernel_memory, OP_CREAR_SEGMENTO);
+    enviar_int32(fd_kernel_memory, pid);
+    enviar_int32(fd_kernel_memory, seg_id);
+    enviar_int32(fd_kernel_memory, tamanio);
+
+    int32_t resp;
+    if (!ks_recibir_de_km(&resp) || resp != OP_OK) {
+        log_error(logger, "## (%d) - MEM_ALLOC: KM respondió error", pid);
+        pthread_mutex_unlock(&mutex_km_socket);
+        return false;
+    }
+
+    int32_t n_trozos;
+    recibir_int32(fd_kernel_memory, &n_trozos);
+    log_info(logger, "## (%d) - MEM_ALLOC: segmento %d creado en %d trozo(s)",
+             pid, seg_id, n_trozos);
+
+    for (int i = 0; i < n_trozos; i++) {
+        int32_t ms_id, dir_fisica, offset_seg, tam;
+        recibir_int32(fd_kernel_memory, &ms_id);
+        recibir_int32(fd_kernel_memory, &dir_fisica);
+        recibir_int32(fd_kernel_memory, &offset_seg);
+        recibir_int32(fd_kernel_memory, &tam);
+        log_info(logger, "## (%d) - MEM_ALLOC trozo %d: MS=%d dir_fis=%d offset=%d tam=%d",
+                 pid, i, ms_id, dir_fisica, offset_seg, tam);
+    }
+
+    pthread_mutex_unlock(&mutex_km_socket);
+    return true;
+}
+
+/* =========================================================
  * Procesamiento de syscall recibida desde la CPU
  * Parsea la instrucción del PCB y despacha al dispositivo correcto.
  * ========================================================= */
@@ -356,7 +426,7 @@ void ks_procesar_syscall(t_pcb *pcb)
                 "(PID=%d script='%s' prioridad=%d)",
                 pcb->pid, nuevo_pid, nombre_script, prioridad);
 
-        pthread_mutex_lock(&mutex_km);
+        pthread_mutex_lock(&mutex_km_socket);
 
         t_paquete *paq = crear_paquete(OP_CREAR_PROCESO, logger);
         agregar_a_paquete(paq, &nuevo_pid,           sizeof(int32_t));
@@ -366,9 +436,9 @@ void ks_procesar_syscall(t_pcb *pcb)
         eliminar_paquete(paq);
 
         int32_t resp_km;
-        bool km_ok = recibir_int32(fd_kernel_memory, &resp_km) && resp_km == OP_OK;
+        bool km_ok = ks_recibir_de_km(&resp_km) && resp_km == OP_OK; // ← antes: recibir_int32
 
-        pthread_mutex_unlock(&mutex_km);
+        pthread_mutex_unlock(&mutex_km_socket);
 
         if (!km_ok) {
             log_error(logger,
@@ -451,8 +521,23 @@ void ks_procesar_syscall(t_pcb *pcb)
         ks_cambiar_estado(pcb, ESTADO_EXIT);
         log_info(logger, "## (%d) finalizó su ejecución con motivo de EXIT", pcb->pid);
 
+    } 
+    
+    else if (!strcmp(op, "MEM_ALLOC")) {
+
+        int32_t seg_id = atoi(pcb->syscall_arg1);
+        int32_t tamanio = atoi(pcb->syscall_arg2);
+        
+        log_info(logger, "## (%d) - Solicitó syscall: MEM_ALLOC seg=%d tam=%d", pcb->pid, seg_id, tamanio);
+
+        if (ks_crear_segmento(pcb->pid, seg_id, tamanio)) {
+            ks_encolar_ready(pcb);
+        } else {
+            ks_cambiar_estado(pcb, ESTADO_EXIT);
+        }
+    
     } else if (!strcmp(op, "MUTEX_CREATE") || !strcmp(op, "MUTEX_LOCK") ||
-               !strcmp(op, "MUTEX_UNLOCK") || !strcmp(op, "MEM_ALLOC")  ||
+               !strcmp(op, "MUTEX_UNLOCK") ||
                !strcmp(op, "MEM_FREE")) {
         /* TODO checkpoint 2/3 */
         log_info(logger, "## (%d) - syscall %s pendiente de implementacion", pcb->pid, op);
@@ -490,10 +575,6 @@ void *atender_cliente_ks(void *varg)
 
         /*
          * Loop planificador:
-         *  1. Esperar que haya un proceso READY (sem_wait)
-         *  2. Cambiar a EXEC y enviar PID a la CPU
-         *  3. Esperar devolución (pid + motivo)
-         *  4. Según motivo: EXIT, SYSCALL o SEG_FAULT
          */
         while (1)
         {
@@ -581,6 +662,7 @@ void *atender_cliente_ks(void *varg)
                      * en el PCB por la CPU antes de devolver el proceso.
                      * El KS la lee y despacha al dispositivo correspondiente.
                      */
+
                     ks_procesar_syscall(pcb);
                     break;
 
@@ -780,6 +862,7 @@ void ks_encolar_ready(t_pcb *pcb)
 }
 
 
+
 /* =========================================================
  * main
  * ========================================================= */
@@ -854,6 +937,9 @@ void ks_encolar_ready(t_pcb *pcb)
     char *ip_km     = config_get_string_value(config, "IP_KERNEL_MEMORY");
     int   puerto_km = config_get_int_value(config, "PUERTO_KERNEL_MEMORY");
     log_info(logger, "Conectando a Kernel Memory %s:%d...", ip_km, puerto_km);
+    
+    
+    /* ── Conectar a KM — UN SOLO SOCKET ── */
     fd_kernel_memory = conectar_a_servidor(logger, ip_km, puerto_km);
     free(ip_km);
     if (fd_kernel_memory == -1) {
@@ -867,10 +953,13 @@ void ks_encolar_ready(t_pcb *pcb)
     }
     log_info(logger, "## Conectado a Kernel Memory (fd=%d)", fd_kernel_memory);
 
+
     /* Crear PID 0 */
     char *script = (argc > 2) ? argv[2] : "prueba";
     int32_t pid0 = 0, prio0 = 0;
 
+
+    pthread_mutex_lock(&mutex_km_socket);
     t_paquete *paq = crear_paquete(OP_CREAR_PROCESO, logger);
     agregar_a_paquete(paq, &pid0,   sizeof(int32_t));
     agregar_a_paquete(paq, &prio0,  sizeof(int32_t));
@@ -878,23 +967,22 @@ void ks_encolar_ready(t_pcb *pcb)
     enviar_paquete(paq, fd_kernel_memory, logger);
     eliminar_paquete(paq);
 
-    /* PCB PID 0 en el planificador */
     t_pcb *pcb0 = ks_crear_pcb(pid0, prio0);
     log_info(logger, "## (<0>) Se crea el proceso - Estado: NEW");
 
-    /* KM responde OK al OP_CREAR_PROCESO */
     int32_t resp_km;
-    if (recibir_int32(fd_kernel_memory, &resp_km) && resp_km == OP_OK)
+    if (ks_recibir_de_km(&resp_km) && resp_km == OP_OK) // ← antes: recibir_int32
         log_info(logger, "KM confirmo creacion de PID 0");
     else
         log_warning(logger, "KM no confirmo creacion de PID 0");
+    pthread_mutex_unlock(&mutex_km_socket);
 
     /* NEW → READY */
     ks_encolar_ready(pcb0);
 
     log_info(logger, "PID 0 en READY — script: %s, prioridad: %d", script, prio0);
 
-    /* Servidor CPUs/IOs */
+    /* Servidor CPUs/IOs (en otro hilo) */
     printf("SISTEMA LISTO - Esperando CPUs/IOs (puerto %d)...\n",
            config_get_int_value(config, "PUERTO_ESCUCHA"));
     log_info(logger, "A la espera de conexiones CPUs/IOs");

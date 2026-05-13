@@ -22,6 +22,8 @@ typedef struct {
     int32_t tamanio;
     int32_t base_global;   /* suma de tamaños anteriores */
     bool    activo;
+    char    ip[64];
+    int32_t puerto_cpus;
 } t_ms_km;
 
 typedef struct

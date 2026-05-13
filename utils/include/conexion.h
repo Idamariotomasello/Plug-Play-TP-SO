@@ -41,9 +41,16 @@ extern pthread_mutex_t  g_mutex_cola_ready;
 extern pthread_mutex_t mutex_fd_ks;
 extern pthread_mutex_t mutex_ms_lista;
 extern pthread_mutex_t mutex_interrupcion_pendiente;
+extern pthread_mutex_t mutex_km_socket;
 
 extern sem_t g_sem_listo;
 
+
+/* Semáforos de sincronización inter-módulo */
+extern sem_t sem_km_cpu;   /* KM→CPU:  KM post luego de responder contexto/fetch  */
+extern sem_t sem_cpu_ks;   /* CPU→KS:  CPU post antes de enviar syscall al KS     */
+extern sem_t sem_ks_km;    /* KS→KM:   KS post antes de enviar OP_CREAR_SEGMENTO  */
+extern sem_t sem_km_ks;    /* KM→KS:   KM post luego de confirmar segmento creado */
 
 typedef struct {
     t_log *logger;

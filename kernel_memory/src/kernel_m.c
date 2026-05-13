@@ -264,8 +264,63 @@ void km_crear_segmento(int fd_ks, int32_t pid, int32_t seg_id, int32_t tam_seg)
         enviar_int32(fd_ks, nuevo_seg.trozos[i].tamanio);
     }
 
-    log_info(g_logger, "## PID: %d - Segmento %d creado en %d trozo(s)",
-             pid, seg_id, nuevo_seg.n_trozos);
+    log_info(g_logger, "## PID: %d - Segmento %d creado en %d trozo(s)", pid, seg_id, nuevo_seg.n_trozos);
+             
+}
+
+void km_eliminar_segmento(int fd_ks, int32_t pid, int32_t seg_id)
+{
+    log_info(g_logger, "## PID: %d - Eliminar segmento %d", pid, seg_id);
+
+    pthread_mutex_lock(&mutex_procesos);
+
+    bool encontrado = false;
+    for (int i = 0; i < KM_MAX_PROCESOS; i++) {
+        if (!g_procesos[i].activo || g_procesos[i].pid != pid)
+            continue;
+
+        for (int j = 0; j < g_procesos[i].n_segmentos; j++) {
+            if (!g_procesos[i].segmentos[j].activo ||
+                g_procesos[i].segmentos[j].seg_id != seg_id)
+                continue;
+
+            /* Loguear trozos que se liberan */
+            t_segmento *seg = &g_procesos[i].segmentos[j];
+            for (int k = 0; k < seg->n_trozos; k++) {
+                log_info(g_logger,
+                         "## PID: %d - Liberando trozo: MS=%d dir_fisica=%d bytes=%d",
+                         pid,
+                         seg->trozos[k].ms_id,
+                         seg->trozos[k].dir_fisica_ms,
+                         seg->trozos[k].tamanio);
+                /* TODO: marcar esas posiciones como libres en la tabla
+                 * de espacio del MS correspondiente (bitácora de huecos) */
+            }
+
+            /* Marcar segmento como inactivo */
+            seg->activo    = false;
+            seg->n_trozos  = 0;
+            encontrado     = true;
+
+            log_info(g_logger,
+                     "## PID: %d - Segmento %d eliminado (%d bytes liberados)",
+                     pid, seg_id, seg->limite);
+            break;
+        }
+        break;
+    }
+
+    pthread_mutex_unlock(&mutex_procesos);
+
+    if (!encontrado) {
+        log_error(g_logger,
+                  "## PID: %d - Segmento %d no encontrado para eliminar",
+                  pid, seg_id);
+        enviar_int32(fd_ks, OP_ERROR);
+        return;
+    }
+
+    enviar_int32(fd_ks, OP_OK);
 }
 
 void km_iniciar_servidor(t_log *logger, int puerto)
@@ -322,7 +377,6 @@ void km_atender_ks(t_log *logger, int fd_ks)
 {
     log_info(logger, "## Kernel Scheduler Conectado - FD del socket: %d", fd_ks);
 
-    /* Guardar fd para poder notificar asíncronamente */
     pthread_mutex_lock(&mutex_fd_ks);
     fd_ks_global = fd_ks;
     pthread_mutex_unlock(&mutex_fd_ks);
@@ -339,15 +393,13 @@ void km_atender_ks(t_log *logger, int fd_ks)
                 break;
             }
             case OP_CREAR_SEGMENTO: {
-                /* KS pide asignar un segmento para un proceso
-                 * Protocolo: pid (int32) | seg_id (int32) | tamanio (int32)
-                 * Responde:  OP_OK | n_trozos (int32) | [ms_id, dir_fisica, offset, tam] x n
-                 *         ó OP_ERROR si no hay espacio */
+
                 int32_t pid, seg_id, tam_seg;
                 recibir_int32(fd_ks, &pid);
                 recibir_int32(fd_ks, &seg_id);
                 recibir_int32(fd_ks, &tam_seg);
                 km_crear_segmento(fd_ks, pid, seg_id, tam_seg);
+
                 break;
             }
             case OP_ELIMINAR_SEGMENTO: {
@@ -446,6 +498,7 @@ void km_atender_cpu(t_log *logger, int fd_cpu)
                 }
                 
                 log_info(logger, "FETCH completado exitosamente");
+
                 break;
             }
             
@@ -476,6 +529,7 @@ void km_atender_cpu(t_log *logger, int fd_cpu)
                 enviar_int32(fd_cpu, n_seg);
                 if (n_seg > 0)
                     send(fd_cpu, segs, n_seg * sizeof(t_segmento), MSG_NOSIGNAL);
+                
                 break;
             }
 
@@ -508,6 +562,31 @@ void km_atender_cpu(t_log *logger, int fd_cpu)
                 break;
             }
 
+            case OP_GET_MS_LIST: {
+                pthread_mutex_lock(&mutex_ms_lista);
+                int32_t n_activos = 0;
+                for (int i = 0; i < g_ms_count; i++)
+                    if (g_ms_lista[i].activo) n_activos++;
+
+                enviar_int32(fd_cpu, n_activos);
+
+                for (int i = 0; i < g_ms_count; i++) {
+                    if (!g_ms_lista[i].activo) continue;
+                    int32_t largo = (int32_t)strlen(g_ms_lista[i].ip);
+                    enviar_int32(fd_cpu, largo);
+                    send(fd_cpu, g_ms_lista[i].ip, largo, MSG_NOSIGNAL);
+                    enviar_int32(fd_cpu, g_ms_lista[i].puerto_cpus);
+                    enviar_int32(fd_cpu, g_ms_lista[i].tamanio);
+                    log_info(logger,
+                            "CPU %d — GET_MS_LIST: MS %d ip=%s puerto=%d tam=%d",
+                            id_cpu, i,
+                            g_ms_lista[i].ip,
+                            g_ms_lista[i].puerto_cpus,
+                            g_ms_lista[i].tamanio);
+                }
+                pthread_mutex_unlock(&mutex_ms_lista);
+                break;
+            }
 
             default:
                 log_warning(logger, "CPU %d — op_code desconocido: %d", id_cpu, cod_op);
@@ -526,8 +605,24 @@ void km_atender_ms(t_log *logger, int fd_ms)
     int32_t tamanio;
     if (!recibir_int32(fd_ms, &tamanio)) {
         log_error(logger, "Error recibiendo tamaño de Memory Stick");
-        close(fd_ms);
-        return;
+        close(fd_ms); return;
+    }
+
+    /* Recibir ip y puerto del MS para que la CPU pueda conectarse */
+    int32_t largo_ip;
+    char ip_ms[64] = {0};
+    int32_t puerto_ms_cpus;
+
+    if (!recibir_int32(fd_ms, &largo_ip) || largo_ip <= 0 || largo_ip >= 64) {
+        log_error(logger, "Error recibiendo IP del MS");
+        close(fd_ms); return;
+    }
+    recv(fd_ms, ip_ms, largo_ip, MSG_WAITALL);
+    ip_ms[largo_ip] = '\0';
+
+    if (!recibir_int32(fd_ms, &puerto_ms_cpus)) {
+        log_error(logger, "Error recibiendo puerto del MS");
+        close(fd_ms); return;
     }
 
     pthread_mutex_lock(&mutex_ms_lista);
@@ -537,46 +632,50 @@ void km_atender_ms(t_log *logger, int fd_ms)
         g_ms_lista[idx].tamanio     = tamanio;
         g_ms_lista[idx].base_global = g_memoria_total;
         g_ms_lista[idx].activo      = true;
+        snprintf(g_ms_lista[idx].ip,    sizeof(g_ms_lista[idx].ip),
+                 "%s", ip_ms);
+        g_ms_lista[idx].puerto_cpus = puerto_ms_cpus;
         g_ms_count++;
         g_memoria_total += tamanio;
     }
     pthread_mutex_unlock(&mutex_ms_lista);
 
-    __atomic_add_fetch(&g_ms_conectados, 1, __ATOMIC_SEQ_CST);
     log_info(logger,
-             "## Memory Stick %d de %d bytes conectada (fd=%d) — "
-             "base_global=%d — memoria_total=%d bytes",
-             idx, tamanio, fd_ms,
-             g_ms_lista[idx].base_global, g_memoria_total);
+             "## MS %d conectado: ip=%s puerto_cpus=%d tamanio=%d "
+             "base_global=%d memoria_total=%d",
+             idx, ip_ms, puerto_ms_cpus,
+             tamanio, g_ms_lista[idx].base_global, g_memoria_total);
 
-    /* Notificar al KS que hay más memoria disponible */
+    /* Notificar al KS */
     pthread_mutex_lock(&mutex_fd_ks);
     if (fd_ks_global != -1) {
-        log_info(logger, "## Notificando KS: OP_NUEVA_MEMORIA (%d bytes totales)",
+        log_info(logger,
+                 "## Notificando KS: OP_NUEVA_MEMORIA total=%d bytes",
                  g_memoria_total);
         enviar_int32(fd_ks_global, OP_NUEVA_MEMORIA);
         enviar_int32(fd_ks_global, g_memoria_total);
     }
     pthread_mutex_unlock(&mutex_fd_ks);
 
+    __atomic_add_fetch(&g_ms_conectados, 1, __ATOMIC_SEQ_CST);
     if (g_ms_conectados == 1)
         sem_post(&g_sem_listo);
 
     /* Monitorear desconexión */
     char probe;
     if (recv(fd_ms, &probe, 1, MSG_WAITALL) <= 0) {
-        log_warning(logger, "## Memory Stick %d desconectada — notificando KS: MEMORIA_CORRUPTA", idx);
+        log_warning(logger,
+                    "## MS %d desconectado (ip=%s) — notificando KS: MEMORIA CORRUPTA",
+                    idx, ip_ms);
 
         pthread_mutex_lock(&mutex_ms_lista);
         g_ms_lista[idx].activo  = false;
         g_memoria_total        -= tamanio;
         pthread_mutex_unlock(&mutex_ms_lista);
 
-        /* Notificar al KS corrupción */
         pthread_mutex_lock(&mutex_fd_ks);
-        if (fd_ks_global != -1) {
+        if (fd_ks_global != -1)
             enviar_int32(fd_ks_global, OP_MEMORIA_CORRUPTA);
-        }
         pthread_mutex_unlock(&mutex_fd_ks);
     }
 

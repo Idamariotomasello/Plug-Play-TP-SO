@@ -51,14 +51,14 @@ int fd_memory_stick;
  
 /* Interrupción compartida entre hilos */
 t_interrupcion interrupcion_pendiente;
-pthread_mutex_t mutex_interrupcion_pendiente;
  
 uint32_t cpu_leer_registro(t_registros *r, const char *n);
 void cpu_escribir_registro(t_registros *r, const char *n, uint32_t v);
 char *cpu_fetch(int32_t pid, uint32_t pc);
 void cpu_mmu_traducir(uint32_t dir_logica, int32_t *num_seg, int32_t *despl);
-bool cpu_leer_memoria(int32_t pid, uint32_t dir_logica, int32_t tamanio, void *dest);
-bool cpu_escribir_memoria(int32_t pid, uint32_t dir_logica, int32_t tamanio, void *src);
+bool cpu_leer_memoria(t_contexto *ctx, uint32_t dir_logica,
+int32_t tamanio, void *dest);
+bool cpu_escribir_memoria(t_contexto *ctx, uint32_t dir_logica, int32_t tamanio, void *src);
 void cpu_limpiar_syscall(t_syscall_pendiente *syscall);
 bool cpu_execute(t_contexto *ctx, const char *linea, e_motivo_retorno *motivo, t_syscall_pendiente *syscall);
 bool cpu_conectar_kernel_scheduler(const char *ip, int puerto);

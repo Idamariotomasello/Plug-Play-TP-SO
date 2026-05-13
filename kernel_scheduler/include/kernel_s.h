@@ -8,7 +8,7 @@
 #define KS_MOTIVO_EXIT         4
 #define KS_MOTIVO_SYSCALL      1
 #define KS_MOTIVO_INTERRUPCION 2
-#define KS_MOTIVO_SEG_FAULT    3
+#define KS_MOTIVO_SEG_FAULT    5
 #define KS_MOTIVO_NINGUNO      0
 
 t_log *logger;

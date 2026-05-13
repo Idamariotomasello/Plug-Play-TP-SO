@@ -107,54 +107,68 @@ void *ms_atender_cpu(void *varg)
         {
             case OP_LEER_MS: {
                 int32_t dir, tam;
-                if (!recibir_int32(fd_cpu, &dir) ||
-                    !recibir_int32(fd_cpu, &tam))
-                {
+                if (!recibir_int32(fd_cpu, &dir) || !recibir_int32(fd_cpu, &tam)) {
                     log_error(logger, "Error recibiendo parametros de lectura");
                     goto desconectar;
                 }
- 
+
+                log_info(logger,
+                        "## CPU %d — LEER: dir_fisica=%d tam=%d",
+                        id_cpu, dir, tam);
+
                 void *buf = malloc(tam);
-                if (!buf || !ms_leer(dir, tam, buf))
-                {
+                if (!buf || !ms_leer(dir, tam, buf)) {
                     free(buf);
+                    log_error(logger,
+                            "## CPU %d — LEER FALLIDA: dir=%d tam=%d (ms_size=%d)",
+                            id_cpu, dir, tam, g_tamanio);
                     enviar_int32(fd_cpu, OP_ERROR);
                     break;
                 }
- 
-                /* respuesta: OK + tamaño + datos */
+
+                log_info(logger,
+                        "## CPU %d — LEER OK: dir=%d tam=%d",
+                        id_cpu, dir, tam);
+
                 enviar_int32(fd_cpu, OP_OK);
                 enviar_int32(fd_cpu, tam);
                 send(fd_cpu, buf, tam, MSG_NOSIGNAL);
                 free(buf);
                 break;
             }
- 
+
             case OP_ESCRIBIR_MS: {
                 int32_t dir, tam;
-                if (!recibir_int32(fd_cpu, &dir) ||
-                    !recibir_int32(fd_cpu, &tam))
-                {
+                if (!recibir_int32(fd_cpu, &dir) || !recibir_int32(fd_cpu, &tam)) {
                     log_error(logger, "Error recibiendo parametros de escritura");
                     goto desconectar;
                 }
- 
+
+                log_info(logger,
+                        "## CPU %d — ESCRIBIR: dir_fisica=%d tam=%d",
+                        id_cpu, dir, tam);
+
                 void *buf = malloc(tam);
-                if (!buf)
-                {
-                    enviar_int32(fd_cpu, OP_ERROR);
-                    break;
-                }
- 
-                if (recv(fd_cpu, buf, tam, MSG_WAITALL) != tam)
-                {
+                if (!buf) { enviar_int32(fd_cpu, OP_ERROR); break; }
+
+                if (recv(fd_cpu, buf, tam, MSG_WAITALL) != tam) {
                     free(buf);
                     enviar_int32(fd_cpu, OP_ERROR);
                     break;
                 }
- 
+
                 bool ok = ms_escribir(dir, tam, buf);
                 free(buf);
+
+                if (ok)
+                    log_info(logger,
+                            "## CPU %d — ESCRIBIR OK: dir=%d tam=%d",
+                            id_cpu, dir, tam);
+                else
+                    log_error(logger,
+                            "## CPU %d — ESCRIBIR FALLIDA: dir=%d tam=%d (ms_size=%d)",
+                            id_cpu, dir, tam, g_tamanio);
+
                 enviar_int32(fd_cpu, ok ? OP_OK : OP_ERROR);
                 break;
             }
@@ -304,11 +318,26 @@ int main(int argc, char *argv[])
  
     /* Enviar tamaño al KM — primer mensaje post-handshake */
     enviar_int32(fd_km, g_tamanio);
-    log_info(logger, "## Conectado a Kernel Memory — tamanio enviado: %d bytes",
-             g_tamanio);
+
+    /* IP propia (leída del config o detectada) */
+    char *ip_propia = config_get_string_value(config, "IP_ESCUCHA");
+    if (!ip_propia) ip_propia = strdup("127.0.0.1");
+    int32_t largo_ip = (int32_t)strlen(ip_propia);
+    enviar_int32(fd_km, largo_ip);
+    send(fd_km, ip_propia, largo_ip, MSG_NOSIGNAL);
+    free(ip_propia);
+    int puerto_escucha = config_get_int_value(config, "PUERTO_ESCUCHA");
+
+    /* Puerto donde escucha CPUs */
+    enviar_int32(fd_km, puerto_escucha);
+
+    log_info(logger,
+            "## Conectado a Kernel Memory — tamanio=%d bytes puerto_cpus=%d",
+            g_tamanio, puerto_escucha);
+            
  
     /* ----- Arrancar servidor de CPUs en hilo propio ----- */
-    int puerto_escucha = config_get_int_value(config, "PUERTO_ESCUCHA");
+
  
     t_srv_arg *srv_arg = malloc(sizeof(t_srv_arg));
     srv_arg->puerto    = puerto_escucha;

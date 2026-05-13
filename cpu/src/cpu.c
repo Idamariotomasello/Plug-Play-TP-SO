@@ -9,7 +9,7 @@ int32_t g_id_cpu = -1;
 int fd_kernel_scheduler_dispatch = -1;
 int fd_kernel_scheduler_interrupt = -1;
 int fd_kernel_memory = -1;
-int fd_memory_stick = -1;
+
 
 int     g_ms_fds[MAX_MS];
 int32_t g_ms_tamanios[MAX_MS];
@@ -277,18 +277,6 @@ void cpu_avanzar_pc_si_corresponde(t_contexto *ctx, bool modifico_pc)
         ctx->regs.PC++;
 }
 
-/*
-bool cpu_enviar_string(int fd, const char *texto)
-{
-    int32_t largo = texto ? (int32_t)strlen(texto) : 0;
-    enviar_int32(fd, largo);
-
-    if (largo <= 0)
-        return true;
-
-    return send(fd, texto, largo, MSG_NOSIGNAL) == largo;
-}
-*/
 
 bool cpu_conectar_kernel_scheduler(const char *ip, int puerto)
 {
@@ -441,7 +429,7 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
             *motivo = MOTIVO_SEG_FAULT;
             return false;
         }
-        cpu_leer_memoria(ctx->pid, ctx->regs.SI, sizeof(uint32_t), &buf);
+        cpu_leer_memoria(ctx, ctx->regs.SI, sizeof(uint32_t), &buf);
     }
     cpu_escribir_registro(&ctx->regs, a1, buf);
     log_info(logger, "## PID: %d - MOV_IN: leído valor=%u → guardado en %s", ctx->pid, buf, a1);
@@ -461,7 +449,7 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
                 *motivo = MOTIVO_SEG_FAULT;
                 return false;
             }
-            cpu_escribir_memoria(ctx->pid, ctx->regs.DI, sizeof(uint32_t), &val);
+            cpu_escribir_memoria(ctx, ctx->regs.DI, sizeof(uint32_t), &val);
         }
         log_info(logger, "## PID: %d - MOV_OUT: valor=%u escrito en dir_fisica=%d", ctx->pid, val, despl);
     }
@@ -510,11 +498,6 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
             return false;
         }
 
-        if (fd_memory_stick == -1) {
-            log_error(logger, "COPY_MEM: Memory Stick no conectado");
-            *motivo = MOTIVO_ERROR;
-            return false;
-        }
 
         void *buf = malloc(tam);
         if (!buf) {
@@ -526,7 +509,7 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
         log_info(logger, "## PID: %d - COPY_MEM: leyendo %d bytes desde dir_fisica=%d",
                 ctx->pid, tam, despl_src);
 
-        if (!cpu_leer_memoria(ctx->pid, ctx->regs.SI, tam, buf)) {
+        if (!cpu_leer_memoria(ctx, ctx->regs.SI, tam, buf)) {
             log_error(logger, "COPY_MEM: fallo lectura desde SI=%u (dir_fisica=%d)",
                     ctx->regs.SI, despl_src);
             free(buf);
@@ -537,7 +520,7 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
         log_info(logger, "## PID: %d - COPY_MEM: escribiendo %d bytes en dir_fisica=%d",
                 ctx->pid, tam, despl_dst);
 
-        if (!cpu_escribir_memoria(ctx->pid, ctx->regs.DI, tam, buf)) {
+        if (!cpu_escribir_memoria(ctx, ctx->regs.DI, tam, buf)) {
             log_error(logger, "COPY_MEM: fallo escritura en DI=%u (dir_fisica=%d)",
                     ctx->regs.DI, despl_dst);
             free(buf);
@@ -658,6 +641,7 @@ void cpu_ciclo_instruccion(t_contexto *ctx)
  
     while (1)
     {
+
         /* ── FETCH ── */
         char *instruccion = cpu_fetch(ctx->pid, ctx->regs.PC);
         if (!instruccion) {
@@ -886,7 +870,6 @@ cleanup:
     if (fd_kernel_scheduler_dispatch > 0) close(fd_kernel_scheduler_dispatch);
     if (fd_kernel_scheduler_interrupt > 0) close(fd_kernel_scheduler_interrupt);
     if (fd_kernel_memory > 0) close(fd_kernel_memory);
-    if (fd_memory_stick > 0) close(fd_memory_stick);
     config_destroy(config);
     log_destroy(logger);
     return 0;
