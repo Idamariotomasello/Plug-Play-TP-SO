@@ -209,8 +209,6 @@ void ms_iniciar_servidor_cpus(int puerto)
         int fd_cpu = esperar_cliente(logger, fd_escucha);
         if (fd_cpu == -1) continue;
  
-        /* El MS no hace handshake con la CPU — la CPU conoce
-         * la dirección del MS a través del KM y conecta directo */
  
         t_hilo_arg *arg = malloc(sizeof(t_hilo_arg));
         if (!arg) { close(fd_cpu); continue; }
