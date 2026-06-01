@@ -21,6 +21,11 @@ int32_t     g_quantum_ms;
 bool        g_preemption;
 int32_t     g_suspension_ms;
 
+typedef struct {
+    int         fd_cpu;        // fd de la CPU que lo ejecuta (-1 si libre)
+    pthread_t   hilo_quantum;  // hilo del timer RR
+    bool        quantum_activo;
+} t_exec_slot;
 
 // Variables globales
 int fd_kernel_memory;

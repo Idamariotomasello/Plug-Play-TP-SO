@@ -1,0 +1,3 @@
+INIT_PROC proc_rr_a 0
+INIT_PROC proc_rr_b 0
+EXIT

@@ -33,10 +33,7 @@ typedef struct {
     int32_t motivo;
 } t_interrupcion;
 
-typedef enum {
-    CANAL_CPU_DISPATCH = 1,
-    CANAL_CPU_INTERRUPT = 2
-} e_canal_cpu_kernel_scheduler;
+
  
 /* Globales del módulo */
 t_log    *logger;

@@ -20,6 +20,16 @@ int             fd_io_stdout = -1;
 t_pcb        g_ks_pcbs[KS_MAX_PROCESOS];
 pthread_mutex_t g_mutex_ks_pcbs = PTHREAD_MUTEX_INITIALIZER;
 
+typedef struct {
+    int32_t id_cpu;
+    int     fd_dispatch;
+    int     fd_interrupt;  // -1 si no usa doble canal
+} t_cpu_slot;
+
+#define MAX_CPUS 8
+t_cpu_slot g_cpus[MAX_CPUS];
+pthread_mutex_t g_mutex_cpus = PTHREAD_MUTEX_INITIALIZER;
+
 /* Semáforo: hay proceso READY para despachar a una CPU */
 sem_t g_sem_ready;
 
@@ -146,6 +156,177 @@ const char *ks_nombre_io(int32_t subtipo)
     }
 }
 
+typedef struct s_io_request {
+    int32_t pid;
+    int32_t subtipo;
+    int32_t param_size;
+    char   *param;
+    struct s_io_request *siguiente;
+} t_io_request;
+
+t_io_request *g_io_queue_head = NULL;
+t_io_request *g_io_queue_tail = NULL;
+pthread_mutex_t g_mutex_io_queue = PTHREAD_MUTEX_INITIALIZER;
+sem_t g_sem_io_request;
+
+static t_io_request *ks_io_request_crear(int32_t pid, int32_t subtipo,
+                                         const void *param, int32_t param_size)
+{
+    t_io_request *req = malloc(sizeof(t_io_request));
+    if (!req) return NULL;
+
+    req->pid = pid;
+    req->subtipo = subtipo;
+    req->param_size = param_size;
+    req->siguiente = NULL;
+
+    if (param_size > 0) {
+        req->param = malloc(param_size);
+        if (!req->param) {
+            free(req);
+            return NULL;
+        }
+        memcpy(req->param, param, param_size);
+    } else {
+        req->param = NULL;
+    }
+
+    return req;
+}
+
+static void ks_io_request_destruir(t_io_request *req)
+{
+    if (!req) return;
+    free(req->param);
+    free(req);
+}
+
+static void ks_io_request_enqueuar(t_io_request *req)
+{
+    pthread_mutex_lock(&g_mutex_io_queue);
+    if (g_io_queue_tail) {
+        g_io_queue_tail->siguiente = req;
+    } else {
+        g_io_queue_head = req;
+    }
+    g_io_queue_tail = req;
+    pthread_mutex_unlock(&g_mutex_io_queue);
+    sem_post(&g_sem_io_request);
+}
+
+static t_io_request *ks_io_request_dequeuar(void)
+{
+    sem_wait(&g_sem_io_request);
+    pthread_mutex_lock(&g_mutex_io_queue);
+    t_io_request *req = g_io_queue_head;
+    if (req) {
+        g_io_queue_head = req->siguiente;
+        if (!g_io_queue_head) {
+            g_io_queue_tail = NULL;
+        }
+    }
+    pthread_mutex_unlock(&g_mutex_io_queue);
+    return req;
+}
+
+static void ks_io_request_completo(t_io_request *req, void *datos, int32_t datos_size)
+{
+    t_pcb *pcb = ks_buscar_pcb(req->pid);
+    if (!pcb) {
+        log_warning(logger,
+                    "## IO %s completado para PID %d pero PCB no existe",
+                    ks_nombre_io(req->subtipo), req->pid);
+        return;
+    }
+
+    if (req->subtipo == OP_IO_STDIN) {
+        log_info(logger,
+                 "## (%d) - STDIN completado: %d bytes recibidos (pendiente escribir en KM)",
+                 req->pid, datos_size);
+        /* TODO: enviar los datos recibidos al KM con OP_ESCRIBIR_DATOS */
+    } else {
+        log_info(logger,
+                 "## (%d) - IO %s completado", req->pid, ks_nombre_io(req->subtipo));
+    }
+
+    ks_encolar_ready(pcb);
+}
+
+static void *ks_io_worker(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        t_io_request *req = ks_io_request_dequeuar();
+        if (!req) continue;
+
+        int fd = ks_fd_io(req->subtipo);
+        if (fd == -1) {
+            log_error(logger,
+                      "## IO %s no disponible para PID %d",
+                      ks_nombre_io(req->subtipo), req->pid);
+            ks_io_request_destruir(req);
+            continue;
+        }
+
+        enviar_int32(fd, req->subtipo);
+        enviar_int32(fd, req->pid);
+
+        if (req->subtipo == OP_IO_SLEEP || req->subtipo == OP_IO_STDIN) {
+            int32_t valor;
+            memcpy(&valor, req->param, sizeof(int32_t));
+            enviar_int32(fd, valor);
+        } else if (req->subtipo == OP_IO_STDOUT) {
+            int32_t tamanio;
+            memcpy(&tamanio, req->param, sizeof(int32_t));
+            enviar_int32(fd, tamanio);
+            send(fd, req->param + sizeof(int32_t), tamanio, MSG_NOSIGNAL);
+        }
+
+        int32_t resp;
+        if (!recibir_int32(fd, &resp) || resp != OP_OK) {
+            log_error(logger,
+                      "## IO %s fallo para PID %d", ks_nombre_io(req->subtipo), req->pid);
+            ks_io_request_destruir(req);
+            continue;
+        }
+
+        if (req->subtipo == OP_IO_STDIN) {
+            int32_t tam;
+            if (!recibir_int32(fd, &tam)) {
+                log_error(logger,
+                          "## STDIN — error recibiendo tamanio para PID %d", req->pid);
+                ks_io_request_destruir(req);
+                continue;
+            }
+
+            void *datos = malloc(tam);
+            if (!datos) {
+                log_error(logger,
+                          "## STDIN — malloc fallo para PID %d", req->pid);
+                ks_io_request_destruir(req);
+                continue;
+            }
+
+            if (recv(fd, datos, tam, MSG_WAITALL) != tam) {
+                log_error(logger,
+                          "## STDIN — error recibiendo datos para PID %d", req->pid);
+                free(datos);
+                ks_io_request_destruir(req);
+                continue;
+            }
+
+            ks_io_request_completo(req, datos, tam);
+            free(datos);
+        } else {
+            ks_io_request_completo(req, NULL, 0);
+        }
+
+        ks_io_request_destruir(req);
+    }
+    return NULL;
+}
+
 /* =========================================================
  * Despacho a dispositivos IO
  * ========================================================= */
@@ -166,20 +347,13 @@ bool ks_despachar_io_sleep(int32_t pid, int32_t tiempo_ms)
     t_pcb *pcb = ks_buscar_pcb(pid);
     if (pcb) ks_cambiar_estado(pcb, ESTADO_BLOCK);
 
-    enviar_int32(fd, OP_IO_SLEEP);
-    enviar_int32(fd, pid);
-    enviar_int32(fd, tiempo_ms);
-
-    int32_t resp;
-    if (!recibir_int32(fd, &resp) || resp != OP_OK) {
-        log_error(logger, "SLEEP — respuesta erronea (PID=%d)", pid);
+    t_io_request *req = ks_io_request_crear(pid, OP_IO_SLEEP, &tiempo_ms, sizeof(tiempo_ms));
+    if (!req) {
+        log_error(logger, "No se pudo encolar IO SLEEP para PID %d", pid);
         return false;
     }
 
-    log_info(logger, "## (%d) finalizó IO y pasa a READY / SUSP. READY", pid);
-    if (pcb) {
-        ks_encolar_ready(pcb);
-    }
+    ks_io_request_enqueuar(req);
     return true;
 }
 
@@ -199,33 +373,13 @@ bool ks_despachar_io_stdin(int32_t pid, int32_t cantidad)
     t_pcb *pcb = ks_buscar_pcb(pid);
     if (pcb) ks_cambiar_estado(pcb, ESTADO_BLOCK);
 
-    enviar_int32(fd, OP_IO_STDIN);
-    enviar_int32(fd, pid);
-    enviar_int32(fd, cantidad);
-
-    int32_t resp;
-    if (!recibir_int32(fd, &resp) || resp != OP_OK) {
-        log_error(logger, "STDIN — respuesta erronea (PID=%d)", pid);
+    t_io_request *req = ks_io_request_crear(pid, OP_IO_STDIN, &cantidad, sizeof(cantidad));
+    if (!req) {
+        log_error(logger, "No se pudo encolar IO STDIN para PID %d", pid);
         return false;
     }
 
-    int32_t tam;
-    if (!recibir_int32(fd, &tam)) {
-        log_error(logger, "STDIN — error recibiendo tamanio (PID=%d)", pid);
-        return false;
-    }
-    void *datos = malloc(tam);
-    if (recv(fd, datos, tam, MSG_WAITALL) != tam) {
-        log_error(logger, "STDIN — error recibiendo datos (PID=%d)", pid);
-        free(datos);
-        return false;
-    }
-    /* TODO checkpoint 3: enviar datos al KM con OP_ESCRIBIR_DATOS */
-    log_info(logger, "## (%d) finalizó IO y pasa a READY / SUSP. READY", pid);
-    free(datos);
-    if (pcb) {
-        ks_encolar_ready(pcb);
-    }
+    ks_io_request_enqueuar(req);
     return true;
 }
 
@@ -245,21 +399,24 @@ bool ks_despachar_io_stdout(int32_t pid, void *datos, int32_t tamanio)
     t_pcb *pcb = ks_buscar_pcb(pid);
     if (pcb) ks_cambiar_estado(pcb, ESTADO_BLOCK);
 
-    enviar_int32(fd, OP_IO_STDOUT);
-    enviar_int32(fd, pid);
-    enviar_int32(fd, tamanio);
-    send(fd, datos, tamanio, MSG_NOSIGNAL);
-
-    int32_t resp;
-    if (!recibir_int32(fd, &resp) || resp != OP_OK) {
-        log_error(logger, "STDOUT — respuesta erronea (PID=%d)", pid);
+    int32_t param_size = sizeof(int32_t) + tamanio;
+    char *payload = malloc(param_size);
+    if (!payload) {
+        log_error(logger, "No se pudo reservar memoria para IO STDOUT de PID %d", pid);
         return false;
     }
 
-    log_info(logger, "## (%d) finalizó IO y pasa a READY / SUSP. READY", pid);
-    if (pcb) {
-        ks_encolar_ready(pcb);
+    memcpy(payload, &tamanio, sizeof(int32_t));
+    memcpy(payload + sizeof(int32_t), datos, tamanio);
+
+    t_io_request *req = ks_io_request_crear(pid, OP_IO_STDOUT, payload, param_size);
+    free(payload);
+    if (!req) {
+        log_error(logger, "No se pudo encolar IO STDOUT para PID %d", pid);
+        return false;
     }
+
+    ks_io_request_enqueuar(req);
     return true;
 }
 
@@ -555,6 +712,44 @@ void ks_procesar_syscall(t_pcb *pcb)
  * Para la CPU: planificador simplificado FIFO.
  * ========================================================= */
 
+typedef struct {
+    t_pcb  *pcb;
+    int     fd_cpu;       // fd de dispatch (no se usa para enviar IRQ)
+    int     fd_interrupt; // fd del canal de interrupciones (-1 si no hay)
+    int32_t id_cpu;
+    int32_t quantum_ms;
+} t_quantum_arg;
+
+void *ks_hilo_quantum(void *varg)
+{
+    t_quantum_arg *arg = (t_quantum_arg *)varg;
+
+    struct timespec ts = {
+        .tv_sec  = arg->quantum_ms / 1000,
+        .tv_nsec = (arg->quantum_ms % 1000) * 1000000L
+    };
+    nanosleep(&ts, NULL);
+
+    /* Si el proceso sigue en EXEC, enviar interrupción */
+    pthread_mutex_lock(&g_mutex_ks_pcbs);
+    bool sigue_exec = (arg->pcb->estado == ESTADO_EXEC);
+    pthread_mutex_unlock(&g_mutex_ks_pcbs);
+
+    if (sigue_exec) {
+        int fd_irq = arg->fd_interrupt; // fd del canal de interrupciones
+        if (fd_irq != -1) {
+            int32_t motivo = (int32_t)MOTIVO_INTERRUPCION;
+            send(fd_irq, &motivo, sizeof(int32_t), MSG_NOSIGNAL);
+            log_info(logger,
+                    "## (Q) Interrupción enviada a CPU %d (fd_irq=%d) — PID %d",
+                    arg->id_cpu, fd_irq, arg->pcb->pid);
+        }
+    }
+
+    free(arg);
+    return NULL;
+}
+
 void *atender_cliente_ks(void *varg)
 {
     t_hilo_arg *arg = (t_hilo_arg *)varg;
@@ -564,14 +759,44 @@ void *atender_cliente_ks(void *varg)
     int32_t tipo = recibir_handshake(logger, fd);
     if (tipo == HANDSHAKE_ERR) { close(fd); return NULL; }
 
-    /* ── CPU ── */
+    /* ── CPU — handshake extendido ── */
     if (tipo == TIPO_CPU) {
         int32_t id_cpu;
-        if (!recibir_int32(fd, &id_cpu)) {
-            log_error(logger, "Error recibiendo ID de CPU (fd=%d)", fd);
-            close(fd); return NULL;
+        if (!recibir_int32(fd, &id_cpu)) { close(fd); return NULL; }
+
+        // Leer canal enviado por la CPU (CANAL_CPU_DISPATCH o CANAL_CPU_INTERRUPT)
+        int32_t canal;
+        if (!recibir_int32(fd, &canal)) { close(fd); return NULL; }
+
+        pthread_mutex_lock(&g_mutex_cpus);
+
+        if (canal == CANAL_CPU_INTERRUPT) {
+            /* Segunda conexión de esta CPU — registrar fd de interrupciones */
+            for (int i = 0; i < MAX_CPUS; i++) {
+                if (g_cpus[i].id_cpu == id_cpu) {
+                    g_cpus[i].fd_interrupt = fd;
+                    log_info(logger, "## CPU %d canal INTERRUPT registrado (fd=%d)", id_cpu, fd);
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_mutex_cpus);
+            /* Este hilo no entra al loop planificador */
+            return NULL;
         }
+
+        /* CANAL_CPU_DISPATCH — registrar slot principal */
+        for (int i = 0; i < MAX_CPUS; i++) {
+            if (g_cpus[i].fd_dispatch == -1) {
+                g_cpus[i].id_cpu       = id_cpu;
+                g_cpus[i].fd_dispatch  = fd;
+                g_cpus[i].fd_interrupt = -1;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_mutex_cpus);
+
         log_info(logger, "## CPU %d Conectada (fd=%d)", id_cpu, fd);
+
 
         /*
          * Loop planificador:
@@ -593,6 +818,36 @@ void *atender_cliente_ks(void *varg)
 
             /* Enviar PID a la CPU */
             enviar_int32(fd, pcb->pid);
+
+
+            /* ── Arrancar timer de quantum si es RR ── */
+            if (g_algoritmo == ALGO_RR) {
+                /* Buscar el fd de interrupciones de esta CPU en g_cpus[] */
+                int fd_irq = -1;
+                pthread_mutex_lock(&g_mutex_cpus);
+                for (int i = 0; i < MAX_CPUS; i++) {
+                    if (g_cpus[i].fd_dispatch == fd) {
+                        fd_irq = g_cpus[i].fd_interrupt;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&g_mutex_cpus);
+
+                t_quantum_arg *qarg = malloc(sizeof(t_quantum_arg));
+                qarg->pcb          = pcb;
+                qarg->fd_cpu       = fd;
+                qarg->fd_interrupt = fd_irq;
+                qarg->id_cpu       = id_cpu;
+                qarg->quantum_ms   = g_quantum_ms;
+
+                pthread_t hilo_q;
+                pthread_create(&hilo_q, NULL, ks_hilo_quantum, qarg);
+                pthread_detach(hilo_q);
+
+                log_info(logger,
+                        "## CPU %d — PID %d ejecutando con quantum=%d ms (fd_irq=%d)",
+                        id_cpu, pcb->pid, g_quantum_ms, fd_irq);
+            }
 
             /* Esperar devolución */
             int32_t pid_ret, motivo;
@@ -691,6 +946,19 @@ void *atender_cliente_ks(void *varg)
         }
 
         log_info(logger, "CPU %d desconectada (fd=%d)", id_cpu, fd);
+
+        /* ── limpiar slot de CPU ── */
+        pthread_mutex_lock(&g_mutex_cpus);
+        for (int i = 0; i < MAX_CPUS; i++) {
+            if (g_cpus[i].fd_dispatch == fd) {
+                g_cpus[i].fd_dispatch  = -1;
+                g_cpus[i].fd_interrupt = -1;
+                g_cpus[i].id_cpu       = -1;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_mutex_cpus);
+
         close(fd);
         return NULL;
     }
@@ -877,6 +1145,13 @@ void ks_encolar_ready(t_pcb *pcb)
     /* Inicializar PCBs */
     memset(g_ks_pcbs, 0, sizeof(g_ks_pcbs));
 
+    /* ── Inicializar slots de CPU ── */
+    for (int i = 0; i < MAX_CPUS; i++) {
+        g_cpus[i].fd_dispatch  = -1;
+        g_cpus[i].fd_interrupt = -1;
+        g_cpus[i].id_cpu       = -1;
+    }
+
     logger = log_create("kernel_scheduler.log", "KERNEL_SCHEDULER", true, LOG_LEVEL_INFO);
     if (!logger) { fprintf(stderr, "Error creando logger\n"); return 1; }
 
@@ -930,6 +1205,14 @@ void ks_encolar_ready(t_pcb *pcb)
 
     /* Semáforo READY arranca en 0 — se señaliza cuando hay proceso listo */
     sem_init(&g_sem_ready, 0, 0);
+    sem_init(&g_sem_io_request, 0, 0);
+
+    pthread_t hilo_io_worker;
+    if (pthread_create(&hilo_io_worker, NULL, ks_io_worker, NULL) != 0) {
+        log_error(logger, "No se pudo crear el hilo worker de IO: %s", strerror(errno));
+    } else {
+        pthread_detach(hilo_io_worker);
+    }
 
     log_info(logger, "Kernel Scheduler iniciando...");
 
@@ -993,6 +1276,7 @@ void ks_encolar_ready(t_pcb *pcb)
 
     log_info(logger, "Kernel Scheduler finalizando...");
     sem_destroy(&g_sem_ready);
+    sem_destroy(&g_sem_io_request);
     close(fd_kernel_memory);
     config_destroy(config);
     log_destroy(logger);

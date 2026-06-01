@@ -673,7 +673,7 @@ void cpu_ciclo_instruccion(t_contexto *ctx)
             pthread_mutex_unlock(&mutex_interrupcion_pendiente);
             break;
         }
-        pthread_mutex_unlock(&mutex_irq);
+        
     }
  
     /* Al guardar contexto: */

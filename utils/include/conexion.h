@@ -57,6 +57,11 @@ typedef struct {
     int fd_cliente;
 } t_hilo_arg;
 
+typedef enum {
+    CANAL_CPU_DISPATCH = 1,
+    CANAL_CPU_INTERRUPT = 2
+} e_canal_cpu_kernel_scheduler;
+
 
 typedef enum
 {    
@@ -210,6 +215,7 @@ typedef struct s_pcb {
     char syscall_nombre[64];       // para syscalls, nombre de la instrucción que la disparó
     char syscall_arg1[64];        // para syscalls, argumento 1 (si tiene)
     char syscall_arg2[64];        // para syscalls, argumento 2 (si
+    int     fd_cpu_asignada;   // fd de la CPU que lo ejecuta actualmente
 } t_pcb;
 
 
