@@ -1,0 +1,3 @@
+INIT_PROC escritor_a 2
+INIT_PROC escritor_b 2
+EXIT

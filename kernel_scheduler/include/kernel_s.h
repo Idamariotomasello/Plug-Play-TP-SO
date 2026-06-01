@@ -4,6 +4,7 @@
 #include <conexion.h>
 
 #define KS_MAX_PROCESOS 64
+#define MAX_CPUS 8
 
 #define KS_MOTIVO_EXIT         4
 #define KS_MOTIVO_SYSCALL      1
@@ -30,7 +31,10 @@ typedef struct {
 // Variables globales
 int fd_kernel_memory;
 
-
+t_pcb *ks_buscar_pcb(int32_t pid);
+void   ks_cambiar_estado(t_pcb *pcb, e_estado_proceso nuevo);
+void   ks_encolar_ready(t_pcb *pcb);
+t_mutex *ks_buscar_mutex(const char *nombre);
 void ks_registrar_io(int fd, int32_t subtipo);
 void ks_encolar_ready(t_pcb *pcb);
 t_pcb *cola_ready_desencolar(void);

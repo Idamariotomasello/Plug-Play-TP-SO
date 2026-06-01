@@ -28,7 +28,7 @@ void saludar(char* quien);
 
 #define MAX_SEGMENTOS   64
 #define MAX_MS          16   /* máximo de Memory Sticks simultáneos */
-
+#define KS_MAX_MUTEX 32
 
 extern t_log *logger;
 extern t_config *config;
@@ -61,6 +61,7 @@ typedef enum {
     CANAL_CPU_DISPATCH = 1,
     CANAL_CPU_INTERRUPT = 2
 } e_canal_cpu_kernel_scheduler;
+
 
 
 typedef enum
@@ -217,6 +218,20 @@ typedef struct s_pcb {
     char syscall_arg2[64];        // para syscalls, argumento 2 (si
     int     fd_cpu_asignada;   // fd de la CPU que lo ejecuta actualmente
 } t_pcb;
+
+typedef struct s_proceso_esperando {
+    t_pcb                    *pcb;
+    struct s_proceso_esperando *siguiente;
+} t_proceso_esperando;
+
+typedef struct {
+    char                 nombre[64];
+    bool                 tomado;
+    int32_t              pid_duenio;       // PID que lo tiene tomado (-1 si libre)
+    int32_t              prioridad_original_duenio; // para restaurar tras herencia
+    t_proceso_esperando *cola_espera;      // procesos bloqueados esperando este mutex
+    bool                 activo;
+} t_mutex;
 
 
 typedef struct

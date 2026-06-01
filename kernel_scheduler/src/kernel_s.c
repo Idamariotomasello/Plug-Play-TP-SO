@@ -20,18 +20,216 @@ int             fd_io_stdout = -1;
 t_pcb        g_ks_pcbs[KS_MAX_PROCESOS];
 pthread_mutex_t g_mutex_ks_pcbs = PTHREAD_MUTEX_INITIALIZER;
 
+t_mutex          g_mutexes[KS_MAX_MUTEX];
+pthread_mutex_t  g_mutex_tabla_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 typedef struct {
     int32_t id_cpu;
     int     fd_dispatch;
     int     fd_interrupt;  // -1 si no usa doble canal
 } t_cpu_slot;
 
-#define MAX_CPUS 8
 t_cpu_slot g_cpus[MAX_CPUS];
 pthread_mutex_t g_mutex_cpus = PTHREAD_MUTEX_INITIALIZER;
 
 /* Semáforo: hay proceso READY para despachar a una CPU */
 sem_t g_sem_ready;
+
+
+
+
+void ks_init_mutexes(void)
+{
+    memset(g_mutexes, 0, sizeof(g_mutexes));
+    for (int i = 0; i < KS_MAX_MUTEX; i++) {
+        g_mutexes[i].activo   = false;
+        g_mutexes[i].tomado   = false;
+        g_mutexes[i].pid_duenio = -1;
+        g_mutexes[i].cola_espera = NULL;
+    }
+}
+
+t_mutex *ks_buscar_mutex(const char *nombre)
+{
+    for (int i = 0; i < KS_MAX_MUTEX; i++)
+        if (g_mutexes[i].activo && !strcmp(g_mutexes[i].nombre, nombre))
+            return &g_mutexes[i];
+    return NULL;
+}
+
+void ks_syscall_mutex_create(t_pcb *pcb, const char *nombre)
+{
+    pthread_mutex_lock(&g_mutex_tabla_mutex);
+
+    // Si ya existe, no hacer nada
+    if (ks_buscar_mutex(nombre)) {
+        log_info(logger, "## (%d) - MUTEX_CREATE: '%s' ya existe", pcb->pid, nombre);
+        pthread_mutex_unlock(&g_mutex_tabla_mutex);
+        ks_encolar_ready(pcb);
+        return;
+    }
+
+    // Buscar slot libre
+    t_mutex *m = NULL;
+    for (int i = 0; i < KS_MAX_MUTEX; i++) {
+        if (!g_mutexes[i].activo) { m = &g_mutexes[i]; break; }
+    }
+
+    if (!m) {
+        log_error(logger, "## (%d) - MUTEX_CREATE: tabla llena", pcb->pid);
+        pthread_mutex_unlock(&g_mutex_tabla_mutex);
+        ks_encolar_ready(pcb);
+        return;
+    }
+
+    strncpy(m->nombre, nombre, sizeof(m->nombre) - 1);
+    m->activo    = true;
+    m->tomado    = false;
+    m->pid_duenio = -1;
+    m->cola_espera = NULL;
+
+    log_info(logger, "## (%d) - MUTEX_CREATE: '%s' creado", pcb->pid, nombre);
+
+    pthread_mutex_unlock(&g_mutex_tabla_mutex);
+    ks_encolar_ready(pcb);
+}
+
+void ks_syscall_mutex_lock(t_pcb *pcb, const char *nombre)
+{
+    pthread_mutex_lock(&g_mutex_tabla_mutex);
+
+    t_mutex *m = ks_buscar_mutex(nombre);
+    if (!m) {
+        log_error(logger, "## (%d) - MUTEX_LOCK: '%s' no existe", pcb->pid, nombre);
+        pthread_mutex_unlock(&g_mutex_tabla_mutex);
+        ks_encolar_ready(pcb);
+        return;
+    }
+
+    if (!m->tomado) {
+        // Mutex libre — tomarlo
+        m->tomado    = true;
+        m->pid_duenio = pcb->pid;
+        m->prioridad_original_duenio = pcb->prioridad;
+
+        log_info(logger,
+                 "## (%d) - MUTEX_LOCK: '%s' tomado (estaba libre)",
+                 pcb->pid, nombre);
+
+        pthread_mutex_unlock(&g_mutex_tabla_mutex);
+        ks_encolar_ready(pcb);
+
+    } else {
+        // Mutex ocupado — bloquear proceso
+        log_info(logger,
+                 "## (%d) - MUTEX_LOCK: '%s' ocupado por PID %d — bloqueando",
+                 pcb->pid, nombre, m->pid_duenio);
+
+        // Encolar en la cola de espera del mutex
+        t_proceso_esperando *nodo = malloc(sizeof(t_proceso_esperando));
+        nodo->pcb       = pcb;
+        nodo->siguiente = NULL;
+
+        // Agregar al final de la cola de espera
+        if (!m->cola_espera) {
+            m->cola_espera = nodo;
+        } else {
+            t_proceso_esperando *cur = m->cola_espera;
+            while (cur->siguiente) cur = cur->siguiente;
+            cur->siguiente = nodo;
+        }
+
+        // Herencia de prioridades (solo aplica en CMN)
+        if (g_algoritmo == ALGO_CMN) {
+            t_pcb *duenio = ks_buscar_pcb(m->pid_duenio);
+            if (duenio && pcb->prioridad < duenio->prioridad) {
+                log_info(logger,
+                         "## (%d) - MUTEX_LOCK: herencia de prioridad — "
+                         "PID %d hereda prioridad %d (tenía %d)",
+                         pcb->pid,
+                         duenio->pid,
+                         pcb->prioridad,
+                         duenio->prioridad);
+                duenio->prioridad = pcb->prioridad;
+            }
+        }
+
+        // Cambiar estado a BLOCK sin encolar en READY
+        ks_cambiar_estado(pcb, ESTADO_BLOCK);
+
+        pthread_mutex_unlock(&g_mutex_tabla_mutex);
+        // NO llamar a ks_encolar_ready — queda bloqueado
+    }
+}
+
+void ks_syscall_mutex_unlock(t_pcb *pcb, const char *nombre)
+{
+    pthread_mutex_lock(&g_mutex_tabla_mutex);
+
+    t_mutex *m = ks_buscar_mutex(nombre);
+    if (!m) {
+        log_error(logger, "## (%d) - MUTEX_UNLOCK: '%s' no existe", pcb->pid, nombre);
+        pthread_mutex_unlock(&g_mutex_tabla_mutex);
+        ks_encolar_ready(pcb);
+        return;
+    }
+
+    if (!m->tomado || m->pid_duenio != pcb->pid) {
+        log_warning(logger,
+                    "## (%d) - MUTEX_UNLOCK: '%s' no está tomado por este proceso",
+                    pcb->pid, nombre);
+        pthread_mutex_unlock(&g_mutex_tabla_mutex);
+        ks_encolar_ready(pcb);
+        return;
+    }
+
+    // Restaurar prioridad original si hubo herencia
+    if (g_algoritmo == ALGO_CMN &&
+        pcb->prioridad != m->prioridad_original_duenio) {
+        log_info(logger,
+                 "## (%d) - MUTEX_UNLOCK: restaurando prioridad original %d (tenía %d por herencia)",
+                 pcb->pid, m->prioridad_original_duenio, pcb->prioridad);
+        pcb->prioridad = m->prioridad_original_duenio;
+    }
+
+    // ¿Hay procesos esperando?
+    if (m->cola_espera) {
+        // Dar el mutex al primero de la cola
+        t_proceso_esperando *nodo = m->cola_espera;
+        m->cola_espera            = nodo->siguiente;
+
+        t_pcb *siguiente = nodo->pcb;
+        free(nodo);
+
+        m->pid_duenio = siguiente->pid;
+        m->prioridad_original_duenio = siguiente->prioridad;
+        // m->tomado sigue en true — lo toma el siguiente
+
+        log_info(logger,
+                 "## (%d) - MUTEX_UNLOCK: '%s' cedido a PID %d",
+                 pcb->pid, nombre, siguiente->pid);
+
+        pthread_mutex_unlock(&g_mutex_tabla_mutex);
+
+        // Desbloquear al siguiente
+        ks_encolar_ready(siguiente);
+
+    } else {
+        // Nadie esperaba — liberar
+        m->tomado     = false;
+        m->pid_duenio = -1;
+
+        log_info(logger,
+                 "## (%d) - MUTEX_UNLOCK: '%s' liberado (nadie esperaba)",
+                 pcb->pid, nombre);
+
+        pthread_mutex_unlock(&g_mutex_tabla_mutex);
+    }
+
+    // El proceso que hizo unlock vuelve a READY
+    ks_encolar_ready(pcb);
+}
+
 
 /* =========================================================
  * Helpers de estado
@@ -693,11 +891,18 @@ void ks_procesar_syscall(t_pcb *pcb)
             ks_cambiar_estado(pcb, ESTADO_EXIT);
         }
     
-    } else if (!strcmp(op, "MUTEX_CREATE") || !strcmp(op, "MUTEX_LOCK") ||
-               !strcmp(op, "MUTEX_UNLOCK") ||
-               !strcmp(op, "MEM_FREE")) {
-        /* TODO checkpoint 2/3 */
-        log_info(logger, "## (%d) - syscall %s pendiente de implementacion", pcb->pid, op);
+    } else if (!strcmp(op, "MUTEX_CREATE")) {
+        ks_syscall_mutex_create(pcb, pcb->syscall_arg1);
+
+    } else if (!strcmp(op, "MUTEX_LOCK")) {
+        ks_syscall_mutex_lock(pcb, pcb->syscall_arg1);
+
+    } else if (!strcmp(op, "MUTEX_UNLOCK")) {
+        ks_syscall_mutex_unlock(pcb, pcb->syscall_arg1);
+
+    } else if (!strcmp(op, "MEM_FREE")) {
+        /* TODO checkpoint siguiente */
+        log_info(logger, "## (%d) - syscall MEM_FREE pendiente de implementacion", pcb->pid);
         ks_encolar_ready(pcb);
 
     } else {
@@ -1151,6 +1356,8 @@ void ks_encolar_ready(t_pcb *pcb)
         g_cpus[i].fd_interrupt = -1;
         g_cpus[i].id_cpu       = -1;
     }
+
+    ks_init_mutexes();
 
     logger = log_create("kernel_scheduler.log", "KERNEL_SCHEDULER", true, LOG_LEVEL_INFO);
     if (!logger) { fprintf(stderr, "Error creando logger\n"); return 1; }
