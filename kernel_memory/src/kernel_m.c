@@ -788,3 +788,95 @@ int main(int argc, char *argv[])
     destruir_semaforos();
     return 0;
 }
+
+void km_agregar_ms(int fd, int32_t tamanio, const char *ip, int32_t puerto_cpus) {
+    int ms_id = g_ms_count++;
+    g_ms_lista[ms_id].fd = fd;
+    g_ms_lista[ms_id].tamanio = tamanio;
+    g_ms_lista[ms_id].base_global = (ms_id == 0) ? 0 : g_ms_lista[ms_id-1].base_global + g_ms_lista[ms_id-1].tamanio;
+    g_ms_lista[ms_id].activo = true;
+    strncpy(g_ms_lista[ms_id].ip, ip, sizeof(g_ms_lista[ms_id].ip));
+    g_ms_lista[ms_id].puerto_cpus = puerto_cpus;
+
+    g_huecos[g_huecos_count++] = (t_hueco){
+        .activo = true,
+        .ms_id = ms_id,
+        .base = 0,
+        .tamanio = tamanio
+    };
+}
+
+t_hueco *km_buscar_hueco(int32_t tamanio) {
+    t_hueco *seleccion = NULL;
+
+    for (int i = 0; i < g_huecos_count; i++) {
+        if (!g_huecos[i].activo || g_huecos[i].tamanio < tamanio) continue;
+
+        if (g_strategy == KM_STRATEGY_FIRST_FIT) {
+            return &g_huecos[i];
+        }
+        if (g_strategy == KM_STRATEGY_BEST_FIT) {
+            if (!seleccion || g_huecos[i].tamanio < seleccion->tamanio)
+                seleccion = &g_huecos[i];
+        }
+        if (g_strategy == KM_STRATEGY_WORST_FIT) {
+            if (!seleccion || g_huecos[i].tamanio > seleccion->tamanio)
+                seleccion = &g_huecos[i];
+        }
+    }
+
+    return seleccion;
+}
+
+bool km_asignar_segmento(int32_t pid, int32_t seg_id, int32_t tam_seg) {
+    int32_t bytes_restantes = tam_seg;
+    int32_t offset_seg = 0;
+    t_segmento seg;
+    memset(&seg, 0, sizeof(seg));
+    seg.activo = true;
+    seg.seg_id = seg_id;
+    seg.limite = tam_seg;
+
+    while (bytes_restantes > 0) {
+        t_hueco *h = km_buscar_hueco(bytes_restantes);
+        if (!h) {
+            return false;
+        }
+
+        int32_t asignar = (bytes_restantes < h->tamanio) ? bytes_restantes : h->tamanio;
+        t_trozo_segmento *trozo = &seg.trozos[seg.n_trozos++];
+        trozo->activo = true;
+        trozo->ms_id = h->ms_id;
+        trozo->dir_fisica_ms = h->base;
+        trozo->offset_seg = offset_seg;
+        trozo->tamanio = asignar;
+        trozo->en_swap = false;
+
+        h->base += asignar;
+        h->tamanio -= asignar;
+        if (h->tamanio == 0) { h->activo = false; }
+
+        bytes_restantes -= asignar;
+        offset_seg += asignar;
+    }
+
+    // Guardar segmento en proceso
+    km_guardar_segmento(pid, &seg);
+    return true;
+}
+
+void km_liberar_trozo(const t_trozo_segmento *trozo) {
+    if (trozo->en_swap) {
+        km_swap_liberar_bloque(trozo->dir_fisica_ms);
+        return;
+    }
+
+    t_hueco nuevo = {
+        .activo = true,
+        .ms_id = trozo->ms_id,
+        .base = trozo->dir_fisica_ms,
+        .tamanio = trozo->tamanio
+    };
+    km_hueco_agregar(&nuevo);
+    km_mergear_huecos(nuevo.ms_id);
+}

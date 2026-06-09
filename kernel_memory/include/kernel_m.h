@@ -5,6 +5,16 @@
 
 #define KM_MAX_PROCESOS     64
 #define KM_MAX_INSTRUCCIONES 1024
+#define KM_MAX_HUECOS   256
+#define KM_MAX_SWAP_BLOQUES 1024
+
+extern t_hueco g_huecos[KM_MAX_HUECOS];
+extern int32_t g_huecos_count;
+
+extern int32_t g_swap_bloques_totales;
+extern bool    g_swap_bloques_libres[KM_MAX_SWAP_BLOQUES];
+extern int32_t g_fd_swap;
+extern t_km_strategy g_strategy;
  
 typedef struct {
     bool     activo;
@@ -32,6 +42,30 @@ typedef struct
     int      fd_cliente;
     int32_t  tipo;
 } t_km_hilo_arg;
+
+
+typedef enum {
+    KM_STRATEGY_FIRST_FIT = 0,
+    KM_STRATEGY_BEST_FIT,
+    KM_STRATEGY_WORST_FIT
+} t_km_strategy;
+
+typedef struct {
+    bool     activo;
+    int32_t  ms_id;
+    int32_t  base;      // offset dentro del MS
+    int32_t  tamanio;   // bytes libres
+} t_hueco;
+
+typedef struct {
+    bool     activo;
+    int32_t  ms_id;          // >=0: Memory Stick; -1: Swap
+    int32_t  dir_fisica_ms;  // offset dentro del MS o número de bloque swap
+    int32_t  offset_seg;     // offset dentro del segmento lógico
+    int32_t  tamanio;        // bytes del trozo
+    bool     en_swap;        // true si el trozo está en swap
+} t_trozo_segmento;
+
 
 t_ms_km  g_ms_lista[MAX_MS];
 int      g_ms_count      = 0;
