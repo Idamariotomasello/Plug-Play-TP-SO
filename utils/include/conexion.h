@@ -42,7 +42,9 @@ extern pthread_mutex_t mutex_fd_ks;
 extern pthread_mutex_t mutex_ms_lista;
 extern pthread_mutex_t mutex_interrupcion_pendiente;
 extern pthread_mutex_t mutex_km_socket;
-
+extern pthread_mutex_t mutex_huecos;
+extern pthread_mutex_t mutex_fd_ks;
+extern pthread_mutex_t mutex_fd_swap;
 extern sem_t g_sem_listo;
 
 
@@ -103,6 +105,7 @@ typedef enum
     OP_CREAR_SEGMENTO = 303,
     OP_ELIMINAR_SEGMENTO = 304,
     OP_GET_MS_LIST = 305,
+    OP_GET_SEGMENT_MAX_SIZE = 306,
     
     //Operaciones KM->KS
     OP_NUEVA_MEMORIA = 500,
@@ -171,11 +174,14 @@ typedef enum {
     MOTIVO_SEG_FAULT = 5
 } e_motivo_retorno;
 
+
 typedef struct {
-    int32_t  ms_id;          /* índice del MS donde está este trozo */
-    int32_t  dir_fisica_ms;  /* dirección física dentro de ese MS   */
-    int32_t  offset_seg;     /* byte de inicio dentro del segmento  */
-    int32_t  tamanio;        /* bytes de este trozo en ese MS       */
+    bool     activo;
+    int32_t  ms_id;          // >=0: Memory Stick; -1: Swap
+    int32_t  dir_fisica_ms;  // offset dentro del MS o número de bloque swap
+    int32_t  offset_seg;     // offset dentro del segmento lógico
+    int32_t  tamanio;        // bytes del trozo
+    bool     en_swap;        // true si el trozo está en swap
 } t_trozo_segmento;
 
 typedef struct {
@@ -249,6 +255,8 @@ typedef struct s_nodo_ready {
 
 extern t_nodo_ready    *g_cola_ready_head;
 extern t_nodo_ready    *g_cola_ready_tail;
+extern int           g_ms_count;
+extern int32_t       g_swap_bloques_totales;
 
 void inicializar_semaforos();
 void destruir_semaforos();

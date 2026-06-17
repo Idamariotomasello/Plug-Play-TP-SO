@@ -60,6 +60,99 @@ bool ms_escribir(int32_t dir_fisica, int32_t tamanio, void *src)
     log_info(logger, "## Escritura de %d bytes", tamanio);
     return true;
 }
+
+/* =========================================================
+ * ms_atender_km
+ * Bucle principal que atiende los comandos del Kernel Memory.
+ * ========================================================= */
+void ms_atender_km(void)
+{
+    int32_t cod_op;
+
+    while (recibir_int32(fd_km, &cod_op)) {
+        switch (cod_op) {
+
+            case OP_LEER_MS: {    /* 700 */
+                int32_t dir_fisica, tamanio;
+                if (!recibir_int32(fd_km, &dir_fisica) ||
+                    !recibir_int32(fd_km, &tamanio)) {
+                    log_error(logger, "Error recibiendo parámetros de LEER_MS");
+                    goto error_km;
+                }
+
+                log_info(logger, "## KM — LEER: dir_fisica=%d tam=%d",
+                         dir_fisica, tamanio);
+
+                void *buf = malloc(tamanio);
+                if (!buf || !ms_leer(dir_fisica, tamanio, buf)) {
+                    free(buf);
+                    enviar_int32(fd_km, OP_ERROR);
+                    log_error(logger,
+                              "## KM — LEER FALLIDA: dir=%d tam=%d (ms_size=%d)",
+                              dir_fisica, tamanio, g_tamanio);
+                    break;
+                }
+
+                enviar_int32(fd_km, OP_OK);
+                enviar_int32(fd_km, tamanio);
+                send(fd_km, buf, tamanio, MSG_NOSIGNAL);
+                free(buf);
+                break;
+            }
+
+            case OP_ESCRIBIR_MS: {   /* 701 */
+                int32_t dir_fisica, tamanio;
+                if (!recibir_int32(fd_km, &dir_fisica) ||
+                    !recibir_int32(fd_km, &tamanio)) {
+                    log_error(logger, "Error recibiendo parámetros de ESCRIBIR_MS");
+                    goto error_km;
+                }
+
+                log_info(logger, "## KM — ESCRIBIR: dir_fisica=%d tam=%d",
+                         dir_fisica, tamanio);
+
+                void *buf = malloc(tamanio);
+                if (!buf) {
+                    enviar_int32(fd_km, OP_ERROR);
+                    break;
+                }
+
+                if (recv(fd_km, buf, tamanio, MSG_WAITALL) != tamanio) {
+                    free(buf);
+                    enviar_int32(fd_km, OP_ERROR);
+                    log_error(logger,
+                              "## KM — ESCRIBIR FALLIDA (recv): dir=%d tam=%d",
+                              dir_fisica, tamanio);
+                    break;
+                }
+
+                bool ok = ms_escribir(dir_fisica, tamanio, buf);
+                free(buf);
+
+                if (ok)
+                    log_info(logger,
+                             "## KM — ESCRIBIR OK: dir=%d tam=%d",
+                             dir_fisica, tamanio);
+                else
+                    log_error(logger,
+                              "## KM — ESCRIBIR FALLIDA: dir=%d tam=%d (ms_size=%d)",
+                              dir_fisica, tamanio, g_tamanio);
+
+                enviar_int32(fd_km, ok ? OP_OK : OP_ERROR);
+                break;
+            }
+
+            default:
+                log_warning(logger, "KM — cod_op desconocido: %d", cod_op);
+                break;
+        }
+    }
+
+error_km:
+    log_warning(logger, "Kernel Memory desconectado (fd=%d)", fd_km);
+    close(fd_km);
+    fd_km = -1;
+}
  
 /* =========================================================
  * ms_atender_cpu
@@ -350,15 +443,13 @@ int main(int argc, char *argv[])
         config_destroy(config); log_destroy(logger);
         return 1;
     }
+
+    pthread_detach(hilo_srv);   // no esperamos a que termine
  
-    /*
-     * El main hace join para que el proceso quede vivo.
-     * El hilo del servidor de CPUs corre indefinidamente;
-     * el hilo del KM (monitor de desconexión) podría agregarse
-     * acá cuando se implemente la desconexión caliente.
-     */
-    pthread_join(hilo_srv, NULL);
- 
+    /* El hilo principal atiende al Kernel Memory */
+    ms_atender_km();
+
+    /* Si ms_atender_km termina (desconexión del KM), finalizamos */
     log_info(logger, "Memory Stick finalizando");
     close(fd_km);
     free(g_memoria);

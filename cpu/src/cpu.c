@@ -21,11 +21,12 @@ t_interrupcion interrupcion_pendiente = { .activa = false, .motivo = 0 };
 bool modo_test_sin_memoria = false;
 bool usar_doble_conexion_kernel_scheduler = false;
 bool enviar_syscall_extendida = false;
+int32_t g_segment_max_size = 0;  /* Será configurado por Kernel Memory */
  
 /* =========================================================
  * Helpers de registros
  * ========================================================= */
- 
+
 uint32_t cpu_leer_registro(t_registros *r, const char *n)
 {
     if (!strcmp(n,"PC"))  return r->PC;
@@ -91,7 +92,7 @@ char *cpu_fetch(int32_t pid, uint32_t pc)
     return instruccion;
 }
 
-int32_t g_segment_max_size = 256;
+//int32_t g_segment_max_size = 256;
 
 void cpu_mmu_traducir(uint32_t dir_logica,
                               int32_t *num_seg, int32_t *despl)
@@ -449,9 +450,16 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
                 *motivo = MOTIVO_SEG_FAULT;
                 return false;
             }
-            cpu_escribir_memoria(ctx, ctx->regs.DI, sizeof(uint32_t), &val);
+
+            if (!cpu_escribir_memoria(ctx, ctx->regs.DI, sizeof(uint32_t), &val)) {
+                *motivo = MOTIVO_SEG_FAULT;
+                return false;
+            }
+
+            log_info(logger, "## PID: %d - MOV_OUT: valor=%u escrito en dir_fisica=%d", ctx->pid, val, despl);
+
         }
-        log_info(logger, "## PID: %d - MOV_OUT: valor=%u escrito en dir_fisica=%d", ctx->pid, val, despl);
+
     }
     else if (!strcmp(op, "COPY_MEM")) {
         int32_t tam = (int32_t)cpu_leer_registro(&ctx->regs, a1);
@@ -750,11 +758,25 @@ int main(int argc, char *argv[])
         enviar_syscall_extendida = config_get_int_value(config, "ENVIAR_SYSCALL_EXTENDIDA") != 0;
     if (enviar_syscall_extendida)
         log_info(logger, "CPU con protocolo extendido de syscall habilitado");
- 
-    /* ── 1. Conectar a Kernel Scheduler ── */
+
     char *ip_ks     = config_get_string_value(config, "IP_KERNEL_SCHEDULER");
     int   puerto_ks = config_get_int_value(config, "PUERTO_KERNEL_SCHEDULER");
+
+    char *ip_km     = config_get_string_value(config, "IP_KERNEL_MEMORY");
+    int   puerto_km = config_get_int_value(config, "PUERTO_KERNEL_MEMORY");
  
+    /* ── Display de configuración (stdout + log) ── */
+    printf("\n========== CONFIGURACIÓN DE CPU %d ==========\n", g_id_cpu);
+    printf("Kernel Scheduler               : %s:%d\n", ip_ks,  puerto_ks);
+    printf("Kernel Memory                  : %s:%d\n", ip_km,  puerto_km);
+    printf("Segment max size               : %d\n",    g_segment_max_size);
+    printf("Modo test sin memoria          : %s\n",    modo_test_sin_memoria                ? "SI" : "NO");
+    printf("Doble conexión KS (IRQ)        : %s\n",    usar_doble_conexion_kernel_scheduler ? "SI" : "NO");
+    printf("Syscall extendida              : %s\n",    enviar_syscall_extendida             ? "SI" : "NO");
+    printf("=============================================\n\n");
+
+    /* ── 1. Conectar a Kernel Scheduler ── */
+
     if (!cpu_conectar_kernel_scheduler(ip_ks, puerto_ks))
     {
         free(ip_ks);
@@ -767,8 +789,6 @@ int main(int argc, char *argv[])
     free(ip_ks);
  
     /* ── 2. Conectar a Kernel Memory ── */
-    char *ip_km     = config_get_string_value(config, "IP_KERNEL_MEMORY");
-    int   puerto_km = config_get_int_value(config, "PUERTO_KERNEL_MEMORY");
 
     log_info(logger, "Conectando a Kernel Memory %s:%d...", ip_km, puerto_km);
     fd_kernel_memory = conectar_a_servidor(logger, ip_km, puerto_km);
@@ -780,6 +800,21 @@ int main(int argc, char *argv[])
  
     enviar_int32(fd_kernel_memory, g_id_cpu);
     log_info(logger, "## CPU %d conectada al Kernel Memory", g_id_cpu);
+
+    /* Solicitar SEGMENT_MAX_SIZE desde Kernel Memory */
+    enviar_int32(fd_kernel_memory, OP_GET_SEGMENT_MAX_SIZE);
+    int32_t resp;
+    if (!recibir_int32(fd_kernel_memory, &resp) || resp != OP_OK) {
+        log_error(logger, "Fallo al obtener SEGMENT_MAX_SIZE desde KM");
+        goto cleanup;
+    }
+    int32_t seg_max_size;
+    if (!recibir_int32(fd_kernel_memory, &seg_max_size) || seg_max_size <= 0) {
+        log_error(logger, "KM devolvió un SEGMENT_MAX_SIZE inválido: %d", seg_max_size);
+        goto cleanup;
+    }
+    g_segment_max_size = seg_max_size;
+    log_info(logger, "## CPU %d - SEGMENT_MAX_SIZE recibido de KM: %d", g_id_cpu, g_segment_max_size);
 
     /* Conectar a Memory Stick */
     char *ip_ms = config_get_string_value(config, "IP_KERNEL_MEMORY_STICK");

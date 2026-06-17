@@ -645,8 +645,8 @@ void ks_syscall_io(int32_t subtipo, int32_t pid, void *param, int32_t param_size
 
 /* =========================================================
  * ks_recibir_de_km
- * Lee un int32 del socket KM descartando cualquier
- * OP_NUEVA_MEMORIA que llegue antes de la respuesta real.
+ * Lee un int32 del socket KM descartando ciertos opcodes
+ * y procesando eventos de compactación.
  * DEBE llamarse con mutex_km_socket ya tomado.
  * ========================================================= */
 bool ks_recibir_de_km(int32_t *out)
@@ -668,6 +668,17 @@ bool ks_recibir_de_km(int32_t *out)
                     g_ks_pcbs[i].estado = ESTADO_EXIT;
             pthread_mutex_unlock(&g_mutex_ks_pcbs);
             exit(1);
+        }
+        if (*out == OP_INICIAR_COMPACT) {
+            log_info(logger, "## Inicio de compactación");
+            /* Enviar confirmación de desalojo al KM */
+            log_info(logger, "Enviando OP_CONFIRMAR_DESALOJO al KM");
+            enviar_int32(fd_kernel_memory, OP_CONFIRMAR_DESALOJO);
+            continue;  /* seguir esperando la respuesta real */
+        }
+        if (*out == OP_FIN_COMPACT) {
+            log_info(logger, "## Fin de compactación");
+            continue;  /* seguir esperando la respuesta real */
         }
         return true;  /* es una respuesta real: OP_OK o OP_ERROR */
     }
@@ -901,8 +912,24 @@ void ks_procesar_syscall(t_pcb *pcb)
         ks_syscall_mutex_unlock(pcb, pcb->syscall_arg1);
 
     } else if (!strcmp(op, "MEM_FREE")) {
-        /* TODO checkpoint siguiente */
-        log_info(logger, "## (%d) - syscall MEM_FREE pendiente de implementacion", pcb->pid);
+        int32_t seg_id = atoi(pcb->syscall_arg1);
+        
+        log_info(logger, "## (%d) - Solicitó syscall: MEM_FREE seg=%d", pcb->pid, seg_id);
+        
+        pthread_mutex_lock(&mutex_km_socket);
+        enviar_int32(fd_kernel_memory, OP_ELIMINAR_SEGMENTO);
+        enviar_int32(fd_kernel_memory, pcb->pid);
+        enviar_int32(fd_kernel_memory, seg_id);
+        
+        int32_t resp;
+        bool ok = ks_recibir_de_km(&resp) && resp == OP_OK;
+        pthread_mutex_unlock(&mutex_km_socket);
+        
+        if (ok)
+            log_info(logger, "## (%d) - MEM_FREE: segmento %d liberado", pcb->pid, seg_id);
+        else
+            log_error(logger, "## (%d) - MEM_FREE: error liberando segmento %d", pcb->pid, seg_id);
+        
         ks_encolar_ready(pcb);
 
     } else {
@@ -1184,6 +1211,8 @@ void *atender_cliente_ks(void *varg)
     return NULL;
 }
 
+
+
 /* =========================================================
  * Accept loop para CPUs e IOs
  * ========================================================= */
@@ -1442,7 +1471,6 @@ void ks_encolar_ready(t_pcb *pcb)
         config_destroy(config); log_destroy(logger); return 1;
     }
     log_info(logger, "## Conectado a Kernel Memory (fd=%d)", fd_kernel_memory);
-
 
     /* Crear PID 0 */
     char *script = (argc > 2) ? argv[2] : "prueba";
