@@ -60,6 +60,22 @@ void cpu_escribir_registro(t_registros *r, const char *n, uint32_t v)
     log_warning(logger, "Registro desconocido al escribir: %s", n);
 }
 
+size_t cpu_tam_registro(const char *n)
+{
+    if (!strcmp(n, "AX") || !strcmp(n, "BX") ||
+        !strcmp(n, "CX") || !strcmp(n, "DX"))
+        return sizeof(uint8_t);
+
+    if (!strcmp(n, "PC")  || !strcmp(n, "EAX") ||
+        !strcmp(n, "EBX") || !strcmp(n, "ECX") ||
+        !strcmp(n, "EDX") || !strcmp(n, "SI")  ||
+        !strcmp(n, "DI"))
+        return sizeof(uint32_t);
+
+    log_warning(logger, "Registro desconocido al calcular tamanio: %s", n);
+    return 0;
+}
+
 char *cpu_fetch(int32_t pid, uint32_t pc)
 {
     log_info(logger, "## PID: %d - FETCH - Program Counter: %d", pid, pc);
@@ -417,6 +433,11 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
     /* Instrucciones de memoria */
     else if (!strcmp(op, "MOV_IN")) {
     uint32_t buf = 0;
+    size_t tam_reg = cpu_tam_registro(a1);
+    if (tam_reg == 0) {
+        *motivo = MOTIVO_ERROR;
+        return false;
+    }
 
     int32_t seg, despl;
     cpu_mmu_traducir(ctx->regs.SI, &seg, &despl);
@@ -424,19 +445,21 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
              ctx->pid, ctx->regs.SI, seg, despl, despl);
 
     if (!modo_test_sin_memoria) {
-        if (despl + (int32_t)sizeof(uint32_t) > g_segment_max_size) {
-            log_error(logger, "## PID: %d - MOV_IN SEG_FAULT: despl(%d)+4 > seg_max(%d)",
-                      ctx->pid, despl, g_segment_max_size);
+        if (!cpu_leer_memoria(ctx, ctx->regs.SI, (int32_t)tam_reg, &buf)) {
             *motivo = MOTIVO_SEG_FAULT;
             return false;
         }
-        cpu_leer_memoria(ctx, ctx->regs.SI, sizeof(uint32_t), &buf);
     }
     cpu_escribir_registro(&ctx->regs, a1, buf);
     log_info(logger, "## PID: %d - MOV_IN: leído valor=%u → guardado en %s", ctx->pid, buf, a1);
     }
     else if (!strcmp(op, "MOV_OUT")) {
         uint32_t val = cpu_leer_registro(&ctx->regs, a1);
+        size_t tam_reg = cpu_tam_registro(a1);
+        if (tam_reg == 0) {
+            *motivo = MOTIVO_ERROR;
+            return false;
+        }
 
         int32_t seg, despl;
         cpu_mmu_traducir(ctx->regs.DI, &seg, &despl);
@@ -444,20 +467,10 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
                 ctx->pid, ctx->regs.DI, seg, despl, despl, val);
 
         if (!modo_test_sin_memoria) {
-            if (despl + (int32_t)sizeof(uint32_t) > g_segment_max_size) {
-                log_error(logger, "## PID: %d - MOV_OUT SEG_FAULT: despl(%d)+4 > seg_max(%d)",
-                        ctx->pid, despl, g_segment_max_size);
+            if (!cpu_escribir_memoria(ctx, ctx->regs.DI, (int32_t)tam_reg, &val)) {
                 *motivo = MOTIVO_SEG_FAULT;
                 return false;
             }
-
-            if (!cpu_escribir_memoria(ctx, ctx->regs.DI, sizeof(uint32_t), &val)) {
-                *motivo = MOTIVO_SEG_FAULT;
-                return false;
-            }
-
-            log_info(logger, "## PID: %d - MOV_OUT: valor=%u escrito en dir_fisica=%d", ctx->pid, val, despl);
-
         }
 
     }
@@ -646,6 +659,11 @@ void cpu_ciclo_instruccion(t_contexto *ctx)
     e_motivo_retorno motivo = MOTIVO_EXIT;
     t_syscall_pendiente syscall;
     cpu_limpiar_syscall(&syscall);
+
+    pthread_mutex_lock(&mutex_interrupcion_pendiente);
+    interrupcion_pendiente.activa = false;
+    interrupcion_pendiente.motivo = MOTIVO_NINGUNO;
+    pthread_mutex_unlock(&mutex_interrupcion_pendiente);
  
     while (1)
     {
@@ -681,7 +699,6 @@ void cpu_ciclo_instruccion(t_contexto *ctx)
             pthread_mutex_unlock(&mutex_interrupcion_pendiente);
             break;
         }
-        
     }
  
     /* Al guardar contexto: */
@@ -779,20 +796,17 @@ int main(int argc, char *argv[])
 
     if (!cpu_conectar_kernel_scheduler(ip_ks, puerto_ks))
     {
-        free(ip_ks);
         log_error(logger, "Fallo conexion/protocolo con KS");
         goto cleanup;
     }
     log_info(logger, "## CPU %d conectada al Kernel Scheduler", g_id_cpu);
     if (usar_doble_conexion_kernel_scheduler)
         log_info(logger, "## CPU %d conectada al canal de interrupciones del Kernel Scheduler", g_id_cpu);
-    free(ip_ks);
  
     /* ── 2. Conectar a Kernel Memory ── */
 
     log_info(logger, "Conectando a Kernel Memory %s:%d...", ip_km, puerto_km);
     fd_kernel_memory = conectar_a_servidor(logger, ip_km, puerto_km);
-    free(ip_km);
     if (fd_kernel_memory == -1) { log_error(logger, "Fallo conexion KM"); goto cleanup; }
  
     if (!enviar_handshake(logger, fd_kernel_memory, TIPO_CPU))

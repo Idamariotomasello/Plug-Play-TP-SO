@@ -51,6 +51,7 @@ t_interrupcion interrupcion_pendiente;
  
 uint32_t cpu_leer_registro(t_registros *r, const char *n);
 void cpu_escribir_registro(t_registros *r, const char *n, uint32_t v);
+size_t cpu_tam_registro(const char *n);
 char *cpu_fetch(int32_t pid, uint32_t pc);
 void cpu_mmu_traducir(uint32_t dir_logica, int32_t *num_seg, int32_t *despl);
 bool cpu_leer_memoria(t_contexto *ctx, uint32_t dir_logica,
