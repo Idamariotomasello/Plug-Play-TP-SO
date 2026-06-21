@@ -359,6 +359,8 @@ typedef struct s_io_request {
     int32_t subtipo;
     int32_t param_size;
     char   *param;
+    uint32_t dir_logica;
+    int32_t  tamanio;
     struct s_io_request *siguiente;
 } t_io_request;
 
@@ -368,26 +370,26 @@ pthread_mutex_t g_mutex_io_queue = PTHREAD_MUTEX_INITIALIZER;
 sem_t g_sem_io_request;
 
 static t_io_request *ks_io_request_crear(int32_t pid, int32_t subtipo,
-                                         const void *param, int32_t param_size)
+                                         const void *param, int32_t param_size,
+                                         uint32_t dir_logica, int32_t tamanio)
 {
     t_io_request *req = malloc(sizeof(t_io_request));
     if (!req) return NULL;
 
     req->pid = pid;
     req->subtipo = subtipo;
-    req->param_size = param_size;
+    req->dir_logica = dir_logica;
+    req->tamanio = tamanio;
     req->siguiente = NULL;
 
     if (param_size > 0) {
         req->param = malloc(param_size);
-        if (!req->param) {
-            free(req);
-            return NULL;
-        }
+        if (!req->param) { free(req); return NULL; }
         memcpy(req->param, param, param_size);
     } else {
         req->param = NULL;
     }
+    req->param_size = param_size;
 
     return req;
 }
@@ -427,30 +429,32 @@ static t_io_request *ks_io_request_dequeuar(void)
     return req;
 }
 
-static void ks_io_request_completo(t_io_request *req, void *datos, int32_t datos_size)
+void ks_io_request_completo(t_io_request *req, void *datos, int32_t datos_size)
 {
     t_pcb *pcb = ks_buscar_pcb(req->pid);
     if (!pcb) {
-        log_warning(logger,
-                    "## IO %s completado para PID %d pero PCB no existe",
-                    ks_nombre_io(req->subtipo), req->pid);
+        log_warning(logger, "IO completado para PID %d pero PCB no existe", req->pid);
         return;
     }
 
     if (req->subtipo == OP_IO_STDIN) {
-        log_info(logger,
-                 "## (%d) - STDIN completado: %d bytes recibidos (pendiente escribir en KM)",
-                 req->pid, datos_size);
-        /* TODO: enviar los datos recibidos al KM con OP_ESCRIBIR_DATOS */
+        log_info(logger, "## (%d) - STDIN completado: %d bytes recibidos, escribiendo en KM...", req->pid, datos_size);
+
+        if (!ks_escribir_datos(req->pid, req->dir_logica, req->tamanio, datos)) {
+            log_error(logger, "## (%d) - STDIN: fallo escritura en memoria (SEG_FAULT)", req->pid);
+            ks_cambiar_estado(pcb, ESTADO_EXIT);
+            return;
+        }
+
+        log_info(logger, "## (%d) - STDIN: datos escritos correctamente en memoria", req->pid);
     } else {
-        log_info(logger,
-                 "## (%d) - IO %s completado", req->pid, ks_nombre_io(req->subtipo));
+        log_info(logger, "## (%d) - IO %s completado", req->pid, ks_nombre_io(req->subtipo));
     }
 
     ks_encolar_ready(pcb);
 }
 
-static void *ks_io_worker(void *arg)
+void *ks_io_worker(void *arg)
 {
     (void)arg;
 
@@ -525,123 +529,6 @@ static void *ks_io_worker(void *arg)
     return NULL;
 }
 
-/* =========================================================
- * Despacho a dispositivos IO
- * ========================================================= */
-
-bool ks_despachar_io_sleep(int32_t pid, int32_t tiempo_ms)
-{
-    pthread_mutex_lock(&mutex_io);
-    int fd = fd_io_sleep;
-    pthread_mutex_unlock(&mutex_io);
-
-    if (fd == -1) {
-        log_error(logger, "Dispositivo IO: SLEEP no encontrado");
-        return false;
-    }
-
-    log_info(logger, "## (%d) - Solicitó syscall: SLEEP", pid);
-
-    t_pcb *pcb = ks_buscar_pcb(pid);
-    if (pcb) ks_cambiar_estado(pcb, ESTADO_BLOCK);
-
-    t_io_request *req = ks_io_request_crear(pid, OP_IO_SLEEP, &tiempo_ms, sizeof(tiempo_ms));
-    if (!req) {
-        log_error(logger, "No se pudo encolar IO SLEEP para PID %d", pid);
-        return false;
-    }
-
-    ks_io_request_enqueuar(req);
-    return true;
-}
-
-bool ks_despachar_io_stdin(int32_t pid, int32_t cantidad)
-{
-    pthread_mutex_lock(&mutex_io);
-    int fd = fd_io_stdin;
-    pthread_mutex_unlock(&mutex_io);
-
-    if (fd == -1) {
-        log_error(logger, "Dispositivo IO: STDIN no encontrado");
-        return false;
-    }
-
-    log_info(logger, "## (%d) - Solicitó syscall: STDIN", pid);
-
-    t_pcb *pcb = ks_buscar_pcb(pid);
-    if (pcb) ks_cambiar_estado(pcb, ESTADO_BLOCK);
-
-    t_io_request *req = ks_io_request_crear(pid, OP_IO_STDIN, &cantidad, sizeof(cantidad));
-    if (!req) {
-        log_error(logger, "No se pudo encolar IO STDIN para PID %d", pid);
-        return false;
-    }
-
-    ks_io_request_enqueuar(req);
-    return true;
-}
-
-bool ks_despachar_io_stdout(int32_t pid, void *datos, int32_t tamanio)
-{
-    pthread_mutex_lock(&mutex_io);
-    int fd = fd_io_stdout;
-    pthread_mutex_unlock(&mutex_io);
-
-    if (fd == -1) {
-        log_error(logger, "Dispositivo IO: STDOUT no encontrado");
-        return false;
-    }
-
-    log_info(logger, "## (%d) - Solicitó syscall: STDOUT", pid);
-
-    t_pcb *pcb = ks_buscar_pcb(pid);
-    if (pcb) ks_cambiar_estado(pcb, ESTADO_BLOCK);
-
-    int32_t param_size = sizeof(int32_t) + tamanio;
-    char *payload = malloc(param_size);
-    if (!payload) {
-        log_error(logger, "No se pudo reservar memoria para IO STDOUT de PID %d", pid);
-        return false;
-    }
-
-    memcpy(payload, &tamanio, sizeof(int32_t));
-    memcpy(payload + sizeof(int32_t), datos, tamanio);
-
-    t_io_request *req = ks_io_request_crear(pid, OP_IO_STDOUT, payload, param_size);
-    free(payload);
-    if (!req) {
-        log_error(logger, "No se pudo encolar IO STDOUT para PID %d", pid);
-        return false;
-    }
-
-    ks_io_request_enqueuar(req);
-    return true;
-}
-
-void ks_syscall_io(int32_t subtipo, int32_t pid, void *param, int32_t param_size)
-{
-    if (ks_fd_io(subtipo) == -1) {
-        log_error(logger, "Dispositivo IO: %s no encontrado", ks_nombre_io(subtipo));
-        return;
-    }
-    switch (subtipo) {
-        case OP_IO_SLEEP: {
-            int32_t t = *((int32_t *)param);
-            ks_despachar_io_sleep(pid, t);
-            break;
-        }
-        case OP_IO_STDIN: {
-            int32_t c = *((int32_t *)param);
-            ks_despachar_io_stdin(pid, c);
-            break;
-        }
-        case OP_IO_STDOUT:
-            ks_despachar_io_stdout(pid, param, param_size);
-            break;
-        default:
-            log_error(logger, "Subtipo IO desconocido: %d", subtipo);
-    }
-}
 
 /* =========================================================
  * ks_recibir_de_km
@@ -723,6 +610,53 @@ bool ks_crear_segmento(int32_t pid, int32_t seg_id, int32_t tamanio)
     return true;
 }
 
+bool ks_leer_datos(int32_t pid, int32_t dir_logica, int32_t tamanio, void *buffer)
+{
+    pthread_mutex_lock(&mutex_km_socket);
+
+    enviar_int32(fd_kernel_memory, OP_LEER_DATOS);
+    enviar_int32(fd_kernel_memory, pid);
+    enviar_int32(fd_kernel_memory, dir_logica);
+    enviar_int32(fd_kernel_memory, tamanio);
+
+    int32_t resp;
+    if (!ks_recibir_de_km(&resp) || resp != OP_OK) {
+        pthread_mutex_unlock(&mutex_km_socket);
+        return false;
+    }
+
+    int32_t tam_recv;
+    if (!recibir_int32(fd_kernel_memory, &tam_recv) || tam_recv != tamanio) {
+        pthread_mutex_unlock(&mutex_km_socket);
+        return false;
+    }
+
+    if (recv(fd_kernel_memory, buffer, tamanio, MSG_WAITALL) != tamanio) {
+        pthread_mutex_unlock(&mutex_km_socket);
+        return false;
+    }
+
+    pthread_mutex_unlock(&mutex_km_socket);
+    return true;
+}
+
+bool ks_escribir_datos(int32_t pid, int32_t dir_logica, int32_t tamanio, void *datos)
+{
+    pthread_mutex_lock(&mutex_km_socket);
+
+    enviar_int32(fd_kernel_memory, OP_ESCRIBIR_DATOS);
+    enviar_int32(fd_kernel_memory, pid);
+    enviar_int32(fd_kernel_memory, dir_logica);
+    enviar_int32(fd_kernel_memory, tamanio);
+    send(fd_kernel_memory, datos, tamanio, MSG_NOSIGNAL);
+
+    int32_t resp;
+    bool ok = ks_recibir_de_km(&resp) && resp == OP_OK;
+
+    pthread_mutex_unlock(&mutex_km_socket);
+    return ok;
+}
+
 /* =========================================================
  * Procesamiento de syscall recibida desde la CPU
  * Parsea la instrucción del PCB y despacha al dispositivo correcto.
@@ -737,21 +671,83 @@ void ks_procesar_syscall(t_pcb *pcb)
 
     if (!strcmp(op, "SLEEP")) {
         int32_t ms = atoi(a1);
-        ks_despachar_io_sleep(pcb->pid, ms);
+        log_info(logger, "## (%d) - SLEEP: %d ms", pcb->pid, ms);
 
+        // Cambiar a BLOCK y encolar request de IO
+        ks_cambiar_estado(pcb, ESTADO_BLOCK);
+
+        t_io_request *req = ks_io_request_crear(pcb->pid, OP_IO_SLEEP, &ms, sizeof(ms), 0, 0);
+        if (!req) {
+            log_error(logger, "SLEEP: no se pudo crear request para PID %d", pcb->pid);
+            ks_cambiar_estado(pcb, ESTADO_EXIT);
+            return;
+        }
+
+        ks_io_request_enqueuar(req);
     } else if (!strcmp(op, "STDIN")) {
-        /* STDIN CX DX — CX tiene dirección lógica, DX tamaño */
-        /* Por ahora enviamos tamaño fijo del registro DX — TODO: leer del PCB */
-        int32_t cantidad = 8;
-        ks_despachar_io_stdin(pcb->pid, cantidad);
+        uint32_t dir_logica = pcb->syscall_val1;
+        int32_t  tamanio    = (int32_t)pcb->syscall_val2;
 
+        log_info(logger, "## (%d) - STDIN: dir_logica=%u, tamanio=%d", pcb->pid, dir_logica, tamanio);
+
+        // Cambiar a BLOCK y encolar request de IO
+        ks_cambiar_estado(pcb, ESTADO_BLOCK);
+
+        t_io_request *req = ks_io_request_crear(pcb->pid, OP_IO_STDIN,
+                                                &tamanio, sizeof(tamanio),
+                                                dir_logica, tamanio);
+        if (!req) {
+            log_error(logger, "STDIN: no se pudo crear request para PID %d", pcb->pid);
+            ks_cambiar_estado(pcb, ESTADO_EXIT);
+            return;
+        }
+
+        ks_io_request_enqueuar(req);
+    
     } else if (!strcmp(op, "STDOUT")) {
-        /* STDOUT AX BX — AX dir lógica, BX tamaño */
-        /* TODO: leer datos del KM antes de enviar */
-        char mock_datos[] = "(datos pendientes KM)";
-        ks_despachar_io_stdout(pcb->pid, mock_datos, strlen(mock_datos));
+        uint32_t dir_logica = pcb->syscall_val1;
+        int32_t  tamanio    = (int32_t)pcb->syscall_val2;
 
-    } else if (!strcmp(op, "INIT_PROC")) {
+        log_info(logger, "## (%d) - STDOUT: dir_logica=%u, tamanio=%d", pcb->pid, dir_logica, tamanio);
+
+        // Leer datos de memoria antes de enviar a IO
+        void *buffer = malloc(tamanio);
+        if (!buffer) {
+            log_error(logger, "STDOUT: malloc falló para PID %d", pcb->pid);
+            ks_cambiar_estado(pcb, ESTADO_EXIT);
+            return;
+        }
+
+        if (!ks_leer_datos(pcb->pid, dir_logica, tamanio, buffer)) {
+            log_error(logger, "STDOUT: fallo lectura de memoria para PID %d (SEG_FAULT)", pcb->pid);
+            free(buffer);
+            ks_cambiar_estado(pcb, ESTADO_EXIT);
+            return;
+        }
+
+        // Cambiar a BLOCK y encolar request de IO con los datos leídos
+        ks_cambiar_estado(pcb, ESTADO_BLOCK);
+
+        // Empaquetar: [int32_t tamanio][datos...]
+        int32_t param_size = sizeof(int32_t) + tamanio;
+        void *param = malloc(param_size);
+        memcpy(param, &tamanio, sizeof(int32_t));
+        memcpy((char*)param + sizeof(int32_t), buffer, tamanio);
+        free(buffer);
+
+        t_io_request *req = ks_io_request_crear(pcb->pid, OP_IO_STDOUT,
+                                            param, param_size,  // ← param con header
+                                            0, 0);
+        free(param);
+
+        if (!req) {
+            log_error(logger, "STDOUT: no se pudo crear request para PID %d", pcb->pid);
+            ks_cambiar_estado(pcb, ESTADO_EXIT);
+            return;
+        }
+
+        ks_io_request_enqueuar(req);
+} else if (!strcmp(op, "INIT_PROC")) {
 
         const char *nombre_script = pcb->syscall_arg1;
         const char *prio_str      = pcb->syscall_arg2;
@@ -1117,6 +1113,9 @@ void *atender_cliente_ks(void *varg)
 
                 int32_t val1, val2;
                 if (!recibir_int32(fd, &val1) || !recibir_int32(fd, &val2)) break;
+
+                pcb->syscall_val1 = (uint32_t)val1;
+                pcb->syscall_val2 = (uint32_t)val2;
 
                 log_info(logger, "## CPU %d — syscall recibida: '%s' arg1='%s' arg2='%s' vals=%d,%d",
                         id_cpu, pcb->syscall_nombre, pcb->syscall_arg1, pcb->syscall_arg2, val1, val2);

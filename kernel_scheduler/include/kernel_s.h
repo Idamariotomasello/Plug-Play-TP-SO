@@ -47,6 +47,7 @@ bool ks_despachar_io_stdin(int32_t pid, int32_t cantidad);
 bool ks_despachar_io_stdout(int32_t pid, void *datos, int32_t
 tamanio);
 void ks_syscall_io(int32_t subtipo, int32_t pid, void *param, int32_t param_size);
+bool ks_escribir_datos(int32_t pid, int32_t dir_logica, int32_t tamanio, void *datos);
 
 void *atender_cliente_ks(void *varg);
 

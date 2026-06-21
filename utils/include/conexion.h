@@ -223,6 +223,8 @@ typedef struct s_pcb {
     char syscall_arg1[64];        // para syscalls, argumento 1 (si tiene)
     char syscall_arg2[64];        // para syscalls, argumento 2 (si
     int     fd_cpu_asignada;   // fd de la CPU que lo ejecuta actualmente
+    uint32_t syscall_val1;
+    uint32_t syscall_val2;
 } t_pcb;
 
 typedef struct s_proceso_esperando {
