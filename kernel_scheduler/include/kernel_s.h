@@ -5,6 +5,7 @@
 
 #define KS_MAX_PROCESOS 64
 #define MAX_CPUS 8
+#define KS_MAX_PRIORIDADES 32
 
 #define KS_MOTIVO_EXIT         4
 #define KS_MOTIVO_SYSCALL      1

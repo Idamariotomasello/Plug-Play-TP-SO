@@ -1,6 +1,7 @@
 #include "kernel_s.h"
 #include <cliente.h>
 #include <server.h>
+#include <ctype.h>
 
 /* =========================================================
  * Globales del módulo
@@ -27,10 +28,191 @@ typedef struct {
     int32_t id_cpu;
     int     fd_dispatch;
     int     fd_interrupt;  // -1 si no usa doble canal
+    t_pcb  *pcb_actual;
+    bool    interrupcion_pendiente;
+    uint64_t dispatch_id;
 } t_cpu_slot;
 
 t_cpu_slot g_cpus[MAX_CPUS];
 pthread_mutex_t g_mutex_cpus = PTHREAD_MUTEX_INITIALIZER;
+
+typedef struct {
+    t_nodo_ready *head;
+    t_nodo_ready *tail;
+} t_cola_ready_local;
+
+t_cola_ready_local g_cmn_colas[KS_MAX_PRIORIDADES];
+e_algoritmo        g_cmn_algoritmos[KS_MAX_PRIORIDADES];
+int32_t            g_cmn_cantidad_colas = 0;
+
+static char *ks_trim(char *s)
+{
+    while (*s && isspace((unsigned char)*s)) s++;
+
+    char *end = s + strlen(s);
+    while (end > s && isspace((unsigned char)*(end - 1))) end--;
+    *end = '\0';
+
+    return s;
+}
+
+static const char *ks_nombre_algoritmo_corto(e_algoritmo algoritmo)
+{
+    switch (algoritmo) {
+        case ALGO_FIFO: return "FIFO";
+        case ALGO_RR:   return "RR";
+        case ALGO_CMN:  return "CMN";
+        default:        return "DESCONOCIDO";
+    }
+}
+
+static bool ks_parse_algoritmo_cola(const char *token, e_algoritmo *out)
+{
+    if (!strcmp(token, "FIFO")) {
+        *out = ALGO_FIFO;
+        return true;
+    }
+
+    if (!strcmp(token, "RR")) {
+        *out = ALGO_RR;
+        return true;
+    }
+
+    return false;
+}
+
+static void ks_inicializar_colas_cmn(void)
+{
+    g_cmn_cantidad_colas = 0;
+    for (int i = 0; i < KS_MAX_PRIORIDADES; i++) {
+        g_cmn_colas[i].head = NULL;
+        g_cmn_colas[i].tail = NULL;
+        g_cmn_algoritmos[i] = ALGO_FIFO;
+    }
+}
+
+static bool ks_configurar_colas_cmn(const char *config_colas)
+{
+    ks_inicializar_colas_cmn();
+
+    if (!config_colas || !*config_colas) {
+        log_error(logger, "QUEUES_ALGORITHMS vacio o ausente");
+        return false;
+    }
+
+    char buffer[512];
+    snprintf(buffer, sizeof(buffer), "%s", config_colas);
+
+    char *inicio = strchr(buffer, '[');
+    char *fin = strrchr(buffer, ']');
+    if (inicio && fin && fin > inicio) {
+        *fin = '\0';
+        inicio++;
+    } else {
+        inicio = buffer;
+    }
+
+    char *saveptr = NULL;
+    char *token = strtok_r(inicio, ",", &saveptr);
+    while (token) {
+        if (g_cmn_cantidad_colas >= KS_MAX_PRIORIDADES) {
+            log_error(logger, "QUEUES_ALGORITHMS supera el maximo de %d colas", KS_MAX_PRIORIDADES);
+            return false;
+        }
+
+        char *nombre = ks_trim(token);
+        e_algoritmo algoritmo;
+        if (!ks_parse_algoritmo_cola(nombre, &algoritmo)) {
+            log_error(logger, "Algoritmo de cola CMN invalido: '%s'", nombre);
+            return false;
+        }
+
+        g_cmn_algoritmos[g_cmn_cantidad_colas] = algoritmo;
+        log_info(logger, "CMN: cola prioridad %d configurada con %s",
+                 g_cmn_cantidad_colas, ks_nombre_algoritmo_corto(algoritmo));
+        g_cmn_cantidad_colas++;
+
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+
+    if (g_cmn_cantidad_colas <= 0) {
+        log_error(logger, "QUEUES_ALGORITHMS no define ninguna cola");
+        return false;
+    }
+
+    return true;
+}
+
+static bool ks_prioridad_valida_cmn(int32_t prioridad)
+{
+    return prioridad >= 0 && prioridad < g_cmn_cantidad_colas;
+}
+
+static e_algoritmo ks_algoritmo_efectivo_pcb(t_pcb *pcb)
+{
+    if (g_algoritmo != ALGO_CMN)
+        return g_algoritmo;
+
+    if (!pcb || !ks_prioridad_valida_cmn(pcb->prioridad))
+        return ALGO_FIFO;
+
+    return g_cmn_algoritmos[pcb->prioridad];
+}
+
+static void ks_evaluar_desalojo_cmn(t_pcb *pcb_nuevo)
+{
+    if (g_algoritmo != ALGO_CMN || !g_preemption || !pcb_nuevo)
+        return;
+
+    if (!ks_prioridad_valida_cmn(pcb_nuevo->prioridad))
+        return;
+
+    int fd_irq = -1;
+    int32_t id_cpu = -1;
+    int32_t pid_desalojado = -1;
+    int32_t prioridad_desalojado = -1;
+    int mejor_slot = -1;
+
+    pthread_mutex_lock(&g_mutex_cpus);
+    for (int i = 0; i < MAX_CPUS; i++) {
+        t_pcb *actual = g_cpus[i].pcb_actual;
+        if (!actual || g_cpus[i].fd_interrupt == -1 || g_cpus[i].interrupcion_pendiente)
+            continue;
+
+        if (actual->estado != ESTADO_EXEC)
+            continue;
+
+        if (actual->prioridad <= pcb_nuevo->prioridad)
+            continue;
+
+        if (mejor_slot == -1 ||
+            actual->prioridad > g_cpus[mejor_slot].pcb_actual->prioridad) {
+            mejor_slot = i;
+        }
+    }
+
+    if (mejor_slot != -1) {
+        t_pcb *victima = g_cpus[mejor_slot].pcb_actual;
+        g_cpus[mejor_slot].interrupcion_pendiente = true;
+        fd_irq = g_cpus[mejor_slot].fd_interrupt;
+        id_cpu = g_cpus[mejor_slot].id_cpu;
+        pid_desalojado = victima->pid;
+        prioridad_desalojado = victima->prioridad;
+    }
+    pthread_mutex_unlock(&g_mutex_cpus);
+
+    if (fd_irq != -1) {
+        int32_t motivo = (int32_t)MOTIVO_INTERRUPCION;
+        send(fd_irq, &motivo, sizeof(int32_t), MSG_NOSIGNAL);
+        log_info(logger,
+                 "## (%d) Prioridad: %d - Desalojado por cola mas prioritaria por el proceso %d con prioridad %d",
+                 pid_desalojado, prioridad_desalojado,
+                 pcb_nuevo->pid, pcb_nuevo->prioridad);
+        log_info(logger,
+                 "## CPU %d - Interrupcion CMN enviada por prioridad (fd_irq=%d)",
+                 id_cpu, fd_irq);
+    }
+}
 
 /* Semáforo: hay proceso READY para despachar a una CPU */
 sem_t g_sem_ready;
@@ -753,6 +935,14 @@ void ks_procesar_syscall(t_pcb *pcb)
         const char *prio_str      = pcb->syscall_arg2;
         int32_t     prioridad     = atoi(prio_str);
 
+        if (g_algoritmo == ALGO_CMN && !ks_prioridad_valida_cmn(prioridad)) {
+            log_error(logger,
+                      "## (%d) - INIT_PROC: prioridad %d fuera de rango CMN [0,%d], no se crea proceso",
+                      pcb->pid, prioridad, g_cmn_cantidad_colas - 1);
+            ks_encolar_ready(pcb);
+            return;
+        }
+
         static int32_t g_next_pid = 1;
         int32_t nuevo_pid = __atomic_fetch_add(&g_next_pid, 1, __ATOMIC_SEQ_CST);
 
@@ -873,9 +1063,8 @@ void ks_procesar_syscall(t_pcb *pcb)
             if (g_preemption) {
                 log_info(logger,
                         "## (%d) - INIT_PROC: [CMN] QUEUE_PREEMPTION=TRUE — "
-                        "verificar si hijo PID %d (prio=%d) desaloja proceso en EXEC",
+                        "desalojo por prioridad evaluado para hijo PID %d (prio=%d)",
                         pcb->pid, nuevo_pid, prioridad);
-                /* TODO: enviar interrupción a CPU si hay proceso en EXEC con menor prioridad */
             }
         }
 
@@ -946,6 +1135,7 @@ typedef struct {
     int     fd_interrupt; // fd del canal de interrupciones (-1 si no hay)
     int32_t id_cpu;
     int32_t quantum_ms;
+    uint64_t dispatch_id;
 } t_quantum_arg;
 
 void *ks_hilo_quantum(void *varg)
@@ -965,7 +1155,24 @@ void *ks_hilo_quantum(void *varg)
 
     if (sigue_exec) {
         int fd_irq = arg->fd_interrupt; // fd del canal de interrupciones
+        bool puede_interrumpir = false;
+
         if (fd_irq != -1) {
+            pthread_mutex_lock(&g_mutex_cpus);
+            for (int i = 0; i < MAX_CPUS; i++) {
+                if (g_cpus[i].fd_dispatch == arg->fd_cpu &&
+                    g_cpus[i].dispatch_id == arg->dispatch_id &&
+                    g_cpus[i].pcb_actual == arg->pcb &&
+                    !g_cpus[i].interrupcion_pendiente) {
+                    g_cpus[i].interrupcion_pendiente = true;
+                    puede_interrumpir = true;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_mutex_cpus);
+        }
+
+        if (fd_irq != -1 && puede_interrumpir) {
             int32_t motivo = (int32_t)MOTIVO_INTERRUPCION;
             send(fd_irq, &motivo, sizeof(int32_t), MSG_NOSIGNAL);
             log_info(logger,
@@ -1018,6 +1225,9 @@ void *atender_cliente_ks(void *varg)
                 g_cpus[i].id_cpu       = id_cpu;
                 g_cpus[i].fd_dispatch  = fd;
                 g_cpus[i].fd_interrupt = -1;
+                g_cpus[i].pcb_actual = NULL;
+                g_cpus[i].interrupcion_pendiente = false;
+                g_cpus[i].dispatch_id = 0;
                 break;
             }
         }
@@ -1042,6 +1252,21 @@ void *atender_cliente_ks(void *varg)
             }
 
             ks_cambiar_estado(pcb, ESTADO_EXEC);
+            int fd_irq_actual = -1;
+            uint64_t dispatch_id_actual = 0;
+            pthread_mutex_lock(&g_mutex_cpus);
+            for (int i = 0; i < MAX_CPUS; i++) {
+                if (g_cpus[i].fd_dispatch == fd) {
+                    g_cpus[i].pcb_actual = pcb;
+                    g_cpus[i].interrupcion_pendiente = false;
+                    g_cpus[i].dispatch_id++;
+                    dispatch_id_actual = g_cpus[i].dispatch_id;
+                    fd_irq_actual = g_cpus[i].fd_interrupt;
+                    pcb->fd_cpu_asignada = fd;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_mutex_cpus);
             log_info(logger, "## CPU %d — enviando PID %d a ejecutar", id_cpu, pcb->pid);
 
             /* Enviar PID a la CPU */
@@ -1049,24 +1274,15 @@ void *atender_cliente_ks(void *varg)
 
 
             /* ── Arrancar timer de quantum si es RR ── */
-            if (g_algoritmo == ALGO_RR) {
-                /* Buscar el fd de interrupciones de esta CPU en g_cpus[] */
-                int fd_irq = -1;
-                pthread_mutex_lock(&g_mutex_cpus);
-                for (int i = 0; i < MAX_CPUS; i++) {
-                    if (g_cpus[i].fd_dispatch == fd) {
-                        fd_irq = g_cpus[i].fd_interrupt;
-                        break;
-                    }
-                }
-                pthread_mutex_unlock(&g_mutex_cpus);
-
+            e_algoritmo algoritmo_exec = ks_algoritmo_efectivo_pcb(pcb);
+            if (algoritmo_exec == ALGO_RR) {
                 t_quantum_arg *qarg = malloc(sizeof(t_quantum_arg));
                 qarg->pcb          = pcb;
                 qarg->fd_cpu       = fd;
-                qarg->fd_interrupt = fd_irq;
+                qarg->fd_interrupt = fd_irq_actual;
                 qarg->id_cpu       = id_cpu;
                 qarg->quantum_ms   = g_quantum_ms;
+                qarg->dispatch_id  = dispatch_id_actual;
 
                 pthread_t hilo_q;
                 pthread_create(&hilo_q, NULL, ks_hilo_quantum, qarg);
@@ -1074,7 +1290,7 @@ void *atender_cliente_ks(void *varg)
 
                 log_info(logger,
                         "## CPU %d — PID %d ejecutando con quantum=%d ms (fd_irq=%d)",
-                        id_cpu, pcb->pid, g_quantum_ms, fd_irq);
+                        id_cpu, pcb->pid, g_quantum_ms, fd_irq_actual);
             }
 
             /* Esperar devolución */
@@ -1084,6 +1300,19 @@ void *atender_cliente_ks(void *varg)
                 ks_encolar_ready(pcb); /* reencolar para intentar ejecutar en otra CPU */
                 break;
             }
+
+            pthread_mutex_lock(&g_mutex_cpus);
+            for (int i = 0; i < MAX_CPUS; i++) {
+                if (g_cpus[i].fd_dispatch == fd &&
+                    g_cpus[i].dispatch_id == dispatch_id_actual &&
+                    g_cpus[i].pcb_actual == pcb) {
+                    g_cpus[i].pcb_actual = NULL;
+                    g_cpus[i].interrupcion_pendiente = false;
+                    pcb->fd_cpu_asignada = -1;
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&g_mutex_cpus);
 
             if (motivo == KS_MOTIVO_SYSCALL) {
                 int32_t largo;
@@ -1185,6 +1414,9 @@ void *atender_cliente_ks(void *varg)
                 g_cpus[i].fd_dispatch  = -1;
                 g_cpus[i].fd_interrupt = -1;
                 g_cpus[i].id_cpu       = -1;
+                g_cpus[i].pcb_actual = NULL;
+                g_cpus[i].interrupcion_pendiente = false;
+                g_cpus[i].dispatch_id = 0;
                 break;
             }
         }
@@ -1280,6 +1512,34 @@ void cola_ready_encolar_frente(t_pcb *pcb)
  * Prioridad 0 = máxima. Igual prioridad → al final del grupo (FIFO dentro del nivel) */
 void cola_ready_encolar_cmn(t_pcb *pcb)
 {
+    if (!ks_prioridad_valida_cmn(pcb->prioridad)) {
+        log_error(logger,
+                  "## (%d) - CMN: prioridad %d fuera de rango [0,%d], no se encola",
+                  pcb->pid, pcb->prioridad, g_cmn_cantidad_colas - 1);
+        ks_cambiar_estado(pcb, ESTADO_EXIT);
+        return;
+    }
+
+    t_nodo_ready *nuevo_cmn = malloc(sizeof(t_nodo_ready));
+    if (!nuevo_cmn) {
+        log_error(logger, "CMN: malloc fallo al encolar PID %d", pcb->pid);
+        ks_cambiar_estado(pcb, ESTADO_EXIT);
+        return;
+    }
+    nuevo_cmn->pcb = pcb;
+    nuevo_cmn->siguiente = NULL;
+
+    pthread_mutex_lock(&g_mutex_cola_ready);
+    t_cola_ready_local *cola = &g_cmn_colas[pcb->prioridad];
+    if (!cola->tail) {
+        cola->head = cola->tail = nuevo_cmn;
+    } else {
+        cola->tail->siguiente = nuevo_cmn;
+        cola->tail = nuevo_cmn;
+    }
+    pthread_mutex_unlock(&g_mutex_cola_ready);
+    return;
+
     t_nodo_ready *nuevo = malloc(sizeof(t_nodo_ready));
     nuevo->pcb       = pcb;
     nuevo->siguiente = NULL;
@@ -1312,6 +1572,28 @@ void cola_ready_encolar_cmn(t_pcb *pcb)
 t_pcb *cola_ready_desencolar(void)
 {
     pthread_mutex_lock(&g_mutex_cola_ready);
+
+    if (g_algoritmo == ALGO_CMN) {
+        for (int prio = 0; prio < g_cmn_cantidad_colas; prio++) {
+            t_cola_ready_local *cola = &g_cmn_colas[prio];
+            if (!cola->head)
+                continue;
+
+            t_nodo_ready *nodo = cola->head;
+            cola->head = nodo->siguiente;
+            if (!cola->head)
+                cola->tail = NULL;
+            pthread_mutex_unlock(&g_mutex_cola_ready);
+
+            t_pcb *pcb = nodo->pcb;
+            free(nodo);
+            return pcb;
+        }
+
+        pthread_mutex_unlock(&g_mutex_cola_ready);
+        return NULL;
+    }
+
     if (!g_cola_ready_head) {
         pthread_mutex_unlock(&g_mutex_cola_ready);
         return NULL;
@@ -1350,6 +1632,14 @@ void ks_encolar_ready(t_pcb *pcb)
             break;
 
         case ALGO_CMN:
+            if (!ks_prioridad_valida_cmn(pcb->prioridad)) {
+                log_error(logger,
+                          "## (%d) - CMN: prioridad %d fuera de rango [0,%d], proceso a EXIT",
+                          pcb->pid, pcb->prioridad, g_cmn_cantidad_colas - 1);
+                ks_cambiar_estado(pcb, ESTADO_EXIT);
+                return;
+            }
+
             log_info(logger,
                      "## (%d) — [CMN] encolando por prioridad %d "
                      "(QUEUE_PREEMPTION=%s)",
@@ -1360,6 +1650,9 @@ void ks_encolar_ready(t_pcb *pcb)
     }
 
     sem_post(&g_sem_ready);
+
+    if (g_algoritmo == ALGO_CMN)
+        ks_evaluar_desalojo_cmn(pcb);
 }
 
 
@@ -1383,6 +1676,9 @@ void ks_encolar_ready(t_pcb *pcb)
         g_cpus[i].fd_dispatch  = -1;
         g_cpus[i].fd_interrupt = -1;
         g_cpus[i].id_cpu       = -1;
+        g_cpus[i].pcb_actual = NULL;
+        g_cpus[i].interrupcion_pendiente = false;
+        g_cpus[i].dispatch_id = 0;
     }
 
     ks_init_mutexes();
@@ -1425,6 +1721,16 @@ void ks_encolar_ready(t_pcb *pcb)
     else if (!strcmp(algoritmo_planificacion, "CMN")) g_algoritmo = ALGO_CMN;
     else                                               g_algoritmo = ALGO_FIFO;
 
+    if (g_algoritmo == ALGO_CMN) {
+        if (!ks_configurar_colas_cmn(cola_algoritmos)) {
+            config_destroy(config);
+            log_destroy(logger);
+            return 1;
+        }
+    } else {
+        ks_inicializar_colas_cmn();
+    }
+
     g_quantum_ms    = quantum_rr;
     g_preemption    = (interrupcion_cola != 0);
     g_suspension_ms = timeout_suspension;
@@ -1433,9 +1739,6 @@ void ks_encolar_ready(t_pcb *pcb)
              algoritmo_planificacion, g_quantum_ms,
              g_preemption ? "TRUE" : "FALSE", g_suspension_ms);
 
-    free(algoritmo_planificacion);
-    free(cola_algoritmos);
-    free(preemption_str);
     /* ================================================================ */
 
     /* Semáforo READY arranca en 0 — se señaliza cuando hay proceso listo */
@@ -1459,7 +1762,6 @@ void ks_encolar_ready(t_pcb *pcb)
     
     /* ── Conectar a KM — UN SOLO SOCKET ── */
     fd_kernel_memory = conectar_a_servidor(logger, ip_km, puerto_km);
-    free(ip_km);
     if (fd_kernel_memory == -1) {
         log_error(logger, "Fallo conexion Kernel Memory");
         config_destroy(config); log_destroy(logger); return 1;
