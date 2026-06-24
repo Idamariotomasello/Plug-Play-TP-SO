@@ -256,6 +256,10 @@ void ks_cambiar_estado(t_pcb *pcb, e_estado_proceso nuevo)
              ks_nombre_estado(pcb->estado),
              ks_nombre_estado(nuevo));
     pcb->estado = nuevo;
+
+    /* registrar instante en que entra a BLOCK */
+    if (nuevo == ESTADO_BLOCK)
+        clock_gettime(CLOCK_MONOTONIC, &pcb->tiempo_block_inicio);
 }
 
 /* =========================================================
@@ -274,6 +278,8 @@ t_pcb *ks_crear_pcb(int32_t pid, int32_t prioridad)
             g_ks_pcbs[i].estado    = ESTADO_NEW;
             g_ks_pcbs[i].activo    = true;
             pcb = &g_ks_pcbs[i];
+            g_ks_pcbs[i].suspension_en_curso      = false;
+            g_ks_pcbs[i].dessuspender_al_terminar = false;
             break;
         }
     }
@@ -429,6 +435,18 @@ static t_io_request *ks_io_request_dequeuar(void)
     return req;
 }
 
+
+/* ks_io_request_completo
+ *
+ * Cuando el IO termina, el proceso puede estar en dos estados:
+ *
+ *   BLOCK      → el timeout NO venció todavía: encolar en READY normalmente.
+ *   SUSP_BLOCK → el timeout venció mientras el IO corría: hay que restaurar
+ *                la memoria desde SWAP (des-suspender) y recién entonces
+ *                encolar en READY.
+ *
+ * Cualquier otro estado es anómalo y se loguea como advertencia.
+ */
 void ks_io_request_completo(t_io_request *req, void *datos, int32_t datos_size)
 {
     t_pcb *pcb = ks_buscar_pcb(req->pid);
@@ -437,22 +455,96 @@ void ks_io_request_completo(t_io_request *req, void *datos, int32_t datos_size)
         return;
     }
 
+    /* Escribir datos de STDIN en memoria (independiente del estado) */
     if (req->subtipo == OP_IO_STDIN) {
-        log_info(logger, "## (%d) - STDIN completado: %d bytes recibidos, escribiendo en KM...", req->pid, datos_size);
+        log_info(logger,
+                 "## (%d) - STDIN completado: %d bytes recibidos, escribiendo en KM...",
+                 req->pid, datos_size);
 
         if (!ks_escribir_datos(req->pid, req->dir_logica, req->tamanio, datos)) {
-            log_error(logger, "## (%d) - STDIN: fallo escritura en memoria (SEG_FAULT)", req->pid);
+            log_error(logger,
+                      "## (%d) - STDIN: fallo escritura en memoria (SEG_FAULT)",
+                      req->pid);
             ks_cambiar_estado(pcb, ESTADO_EXIT);
             return;
         }
-
-        log_info(logger, "## (%d) - STDIN: datos escritos correctamente en memoria", req->pid);
+        log_info(logger, "## (%d) - STDIN: datos escritos correctamente en memoria",
+                 req->pid);
     } else {
-        log_info(logger, "## (%d) - IO %s completado", req->pid, ks_nombre_io(req->subtipo));
+        log_info(logger, "## (%d) - IO %s completado",
+                 req->pid, ks_nombre_io(req->subtipo));
     }
 
-    ks_encolar_ready(pcb);
+    /* Leer estado actual con el mutex tomado para evitar race con el hilo
+     * de suspensión que podría estar modificándolo al mismo tiempo */
+    pthread_mutex_lock(&g_mutex_ks_pcbs);
+    e_estado_proceso estado_actual = pcb->estado;
+    pthread_mutex_unlock(&g_mutex_ks_pcbs);
+
+    if (estado_actual == ESTADO_BLOCK) {
+        /* Caso normal: el timeout no venció, encolamos directo */
+        log_info(logger,
+                 "## (%d) - IO completado en tiempo — proceso vuelve a READY",
+                 pcb->pid);
+        ks_encolar_ready(pcb);
+
+    } else if (estado_actual == ESTADO_SUSP_BLOCK) {
+
+        pthread_mutex_lock(&g_mutex_ks_pcbs);
+        bool en_curso = pcb->suspension_en_curso;
+        pthread_mutex_unlock(&g_mutex_ks_pcbs);
+
+        if (en_curso) {
+            // El KM todavía está procesando el swap. No podemos usar
+            // mutex_km_socket porque lo tiene ks_hilo_suspension.
+            // Marcar el flag para que ks_hilo_suspension maneje el dessuspender
+            // cuando reciba el OP_OK del KM.
+            pthread_mutex_lock(&g_mutex_ks_pcbs);
+            pcb->dessuspender_al_terminar = true;
+            pthread_mutex_unlock(&g_mutex_ks_pcbs);
+
+            log_info(logger,
+                    "## (%d) - IO completado pero suspensión en curso — "
+                    "marcando dessuspender_al_terminar",
+                    pcb->pid);
+            // No llamar a ks_encolar_ready acá.
+            // ks_hilo_suspension lo encolará cuando termine.
+
+        } else {
+            // La suspensión ya completó, el proceso está en SUSP_BLOCK estable.
+            // Des-suspender normalmente (código que ya existía):
+            log_info(logger,
+                    "## (%d) - IO completado en SUSP_BLOCK — des-suspendiendo",
+                    pcb->pid);
+
+            pthread_mutex_lock(&mutex_km_socket);
+            enviar_int32(fd_kernel_memory, OP_DESSUSPENDER_PROCESO);
+            enviar_int32(fd_kernel_memory, pcb->pid);
+            int32_t resp;
+            bool recv_ok = ks_recibir_de_km(&resp);
+            pthread_mutex_unlock(&mutex_km_socket);
+            bool ok = recv_ok && resp == OP_OK;
+
+            if (ok) {
+                log_info(logger,
+                        "## (%d) - Des-suspensión OK — proceso vuelve a READY",
+                        pcb->pid);
+                ks_cambiar_estado(pcb, ESTADO_BLOCK);
+                ks_encolar_ready(pcb);
+            } else {
+                log_error(logger,
+                        "## (%d) - Des-suspensión falló — proceso pasa a EXIT",
+                        pcb->pid);
+                ks_cambiar_estado(pcb, ESTADO_EXIT);
+            }
+        }
+    } else {
+        log_warning(logger,
+                    "## (%d) - IO completado pero proceso en estado inesperado: %s",
+                    pcb->pid, ks_nombre_estado(estado_actual));
+    }
 }
+
 
 void *ks_io_worker(void *arg)
 {
@@ -526,6 +618,168 @@ void *ks_io_worker(void *arg)
 
         ks_io_request_destruir(req);
     }
+    return NULL;
+}
+
+
+/*
+ * ks_suspender_proceso
+ * Envía OP_SUSPENDER_PROCESO al KM y cambia el estado del PCB.
+ * Debe llamarse SIN mutex_km_socket tomado.
+ */
+bool ks_suspender_proceso(t_pcb *pcb)
+{
+    log_info(logger,
+             "## (%d) - Suspendiendo proceso (BLOCK → SUSP_BLOCK) — enviando a SWAP",
+             pcb->pid);
+
+    pthread_mutex_lock(&mutex_km_socket);
+    enviar_int32(fd_kernel_memory, OP_SUSPENDER_PROCESO);
+    enviar_int32(fd_kernel_memory, pcb->pid);
+    int32_t resp;
+    bool ok = ks_recibir_de_km(&resp) && resp == OP_OK;
+    pthread_mutex_unlock(&mutex_km_socket);
+
+    if (ok) {
+        ks_cambiar_estado(pcb, ESTADO_SUSP_BLOCK);
+        log_info(logger, "## (%d) - Proceso suspendido correctamente", pcb->pid);
+    } else {
+        log_error(logger, "## (%d) - KM rechazó la suspensión", pcb->pid);
+    }
+    return ok;
+}
+
+/*
+ * ks_dessuspender_proceso
+ * Envía OP_DESSUSPENDER_PROCESO al KM para restaurar memoria desde SWAP.
+ * Debe llamarse SIN mutex_km_socket tomado.
+ */
+bool ks_dessuspender_proceso(t_pcb *pcb)
+{
+    log_info(logger,
+             "## (%d) - Des-suspendiendo proceso (SUSP_BLOCK → BLOCK) — restaurando de SWAP",
+             pcb->pid);
+
+    pthread_mutex_lock(&mutex_km_socket);
+    enviar_int32(fd_kernel_memory, OP_DESSUSPENDER_PROCESO);
+    enviar_int32(fd_kernel_memory, pcb->pid);
+    int32_t resp;
+    bool ok = ks_recibir_de_km(&resp) && resp == OP_OK;
+    pthread_mutex_unlock(&mutex_km_socket);
+
+    if (ok) {
+        /* Vuelve a BLOCK — el caller luego lo encolará en READY */
+        ks_cambiar_estado(pcb, ESTADO_BLOCK);
+        log_info(logger, "## (%d) - Proceso des-suspendido correctamente", pcb->pid);
+    } else {
+        log_error(logger, "## (%d) - KM rechazó la des-suspensión", pcb->pid);
+    }
+    return ok;
+}
+
+/* ks_hilo_suspension
+ * Se lanza una vez al inicio. Cada segundo recorre todos los PCBs activos
+ * y suspende los que llevan más de g_suspension_ms en BLOCK.
+ *
+ * Usa pcb->tiempo_block_inicio (campo nuevo en t_pcb, ver kernel_s.h)
+ * que se setea en ks_cambiar_estado() cuando el nuevo estado es ESTADO_BLOCK.
+ */
+
+void *ks_hilo_suspension(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        struct timespec ts = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&ts, NULL);
+
+        struct timespec ahora;
+        clock_gettime(CLOCK_MONOTONIC, &ahora);
+
+        pthread_mutex_lock(&g_mutex_ks_pcbs);
+
+        for (int i = 0; i < KS_MAX_PROCESOS; i++) {
+            t_pcb *pcb = &g_ks_pcbs[i];
+            if (!pcb->activo || pcb->estado != ESTADO_BLOCK)
+                continue;
+
+            long elapsed_ms =
+                (ahora.tv_sec  - pcb->tiempo_block_inicio.tv_sec)  * 1000L +
+                (ahora.tv_nsec - pcb->tiempo_block_inicio.tv_nsec) / 1000000L;
+
+            if (elapsed_ms >= g_suspension_ms) {
+                log_info(logger,
+                         "## (%d) - Timeout de suspensión vencido (%ld ms >= %d ms)",
+                         pcb->pid, elapsed_ms, g_suspension_ms);
+
+                ks_cambiar_estado(pcb, ESTADO_SUSP_BLOCK);
+                pcb->suspension_en_curso      = true;
+                pcb->dessuspender_al_terminar = false;
+                pthread_mutex_unlock(&g_mutex_ks_pcbs);
+
+                pthread_mutex_lock(&mutex_km_socket);
+                enviar_int32(fd_kernel_memory, OP_SUSPENDER_PROCESO);
+                enviar_int32(fd_kernel_memory, pcb->pid);
+                int32_t resp;
+
+               bool recv_ok = ks_recibir_de_km(&resp);
+               pthread_mutex_unlock(&mutex_km_socket); // ← siempre se libera
+               bool ok = recv_ok && resp == OP_OK;
+
+                pthread_mutex_lock(&g_mutex_ks_pcbs);
+
+                if (ok) {
+                    pcb->suspension_en_curso = false;
+
+                    if (pcb->dessuspender_al_terminar) {
+                        // El IO terminó mientras el KM estaba swapeando.
+                        // Hay que des-suspender ahora y encolar en READY.
+                        pcb->dessuspender_al_terminar = false;
+                        pthread_mutex_unlock(&g_mutex_ks_pcbs);
+
+                        // Des-suspender: restaurar memoria desde SWAP
+                        pthread_mutex_lock(&mutex_km_socket);
+                        enviar_int32(fd_kernel_memory, OP_DESSUSPENDER_PROCESO);
+                        enviar_int32(fd_kernel_memory, pcb->pid);
+                        int32_t resp2;
+                        bool recv_ok2 = ks_recibir_de_km(&resp2);
+                        pthread_mutex_unlock(&mutex_km_socket);
+
+                        if (recv_ok2 && resp2 == OP_OK) {
+                            log_info(logger,
+                                    "## (%d) - Des-suspensión tardía OK — proceso va a READY",
+                                    pcb->pid);
+                            ks_cambiar_estado(pcb, ESTADO_BLOCK); // ks_encolar_ready lo pasará a READY
+                            ks_encolar_ready(pcb);
+                        } else {
+                            log_error(logger,
+                                    "## (%d) - Des-suspensión tardía falló — proceso pasa a EXIT",
+                                    pcb->pid);
+                            ks_cambiar_estado(pcb, ESTADO_EXIT);
+                        }
+                        // El mutex de pcbs ya fue soltado arriba antes del dessuspender,
+                        // así que no hay que volver a tomarlo para el continue del loop.
+                        continue; // ← volver al nanosleep del while(1)
+                    }
+
+                    log_info(logger,
+                            "## (%d) Pasa del estado BLOCK al estado SUSP_BLOCK",
+                            pcb->pid);
+                    // El proceso queda en SUSP_BLOCK esperando que el IO termine.
+
+                } else {
+                    log_error(logger,
+                             "## (%d) - Suspensión falló (recv_ok=%d resp=%d) — "
+                             "proceso vuelve a BLOCK",
+                             pcb->pid, recv_ok, resp);
+                    pcb->estado = ESTADO_BLOCK;
+                }
+            }
+        }
+
+        pthread_mutex_unlock(&g_mutex_ks_pcbs);
+    }
+
     return NULL;
 }
 
@@ -1363,28 +1617,18 @@ void ks_encolar_ready(t_pcb *pcb)
 }
 
 
+/* main */
 
-/* =========================================================
- * main
- * ========================================================= */
-
- int main(int argc, char *argv[])
+int main(int argc, char *argv[])
 {
     if (argc < 2) {
         fprintf(stderr, "Uso: %s kernel_s.config [nombre_script]\n", argv[0]);
         return 1;
     }
 
-    /* Inicializar PCBs */
     memset(g_ks_pcbs, 0, sizeof(g_ks_pcbs));
-
-    /* ── Inicializar slots de CPU ── */
-    for (int i = 0; i < MAX_CPUS; i++) {
-        g_cpus[i].fd_dispatch  = -1;
-        g_cpus[i].fd_interrupt = -1;
-        g_cpus[i].id_cpu       = -1;
-    }
-
+    for (int i = 0; i < MAX_CPUS; i++)
+        { g_cpus[i].fd_dispatch = -1; g_cpus[i].fd_interrupt = -1; g_cpus[i].id_cpu = -1; }
     ks_init_mutexes();
 
     logger = log_create("kernel_scheduler.log", "KERNEL_SCHEDULER", true, LOG_LEVEL_INFO);
@@ -1396,20 +1640,15 @@ void ks_encolar_ready(t_pcb *pcb)
         snprintf(alt, sizeof(alt), "../%s", argv[1]);
         config = config_create(alt);
     }
-    if (!config) {
-        log_error(logger, "No se pudo cargar '%s'", argv[1]);
-        log_destroy(logger); return 1;
-    }
+    if (!config) { log_error(logger, "No se pudo cargar config"); log_destroy(logger); return 1; }
 
-    /* ===== LECTURA DE PARÁMETROS DE CONFIGURACIÓN ===== */
     char *algoritmo_planificacion = config_get_string_value(config, "PLANIFICATION_ALGORITHM");
     char *cola_algoritmos         = config_get_string_value(config, "QUEUES_ALGORITHMS");
     int   quantum_rr              = config_get_int_value(config, "RR_QUANTUM");
-    char *preemption_str = config_get_string_value(config, "QUEUE_PREEMPTION");
-    int interrupcion_cola = (strcmp(preemption_str, "TRUE") == 0);
+    char *preemption_str          = config_get_string_value(config, "QUEUE_PREEMPTION");
+    int   interrupcion_cola       = (strcmp(preemption_str, "TRUE") == 0);
     int   timeout_suspension      = config_get_int_value(config, "SUSPENSION_TIMEOUT");
 
-    /* Mostrar por pantalla */
     printf("\n========== CONFIGURACIÓN DEL KERNEL SCHEDULER ==========\n");
     printf("Algoritmo de planificación : %s\n", algoritmo_planificacion);
     printf("Cola de algoritmos         : %s\n", cola_algoritmos);
@@ -1418,9 +1657,6 @@ void ks_encolar_ready(t_pcb *pcb)
     printf("Timeout de suspensión (ms) : %d\n", timeout_suspension);
     printf("=======================================================\n\n");
 
-    /* ===================================================== */
-
-    /* ── Inicializar globales de planificación desde los valores leídos ── */
     if      (!strcmp(algoritmo_planificacion, "RR"))  g_algoritmo = ALGO_RR;
     else if (!strcmp(algoritmo_planificacion, "CMN")) g_algoritmo = ALGO_CMN;
     else                                               g_algoritmo = ALGO_FIFO;
@@ -1436,28 +1672,30 @@ void ks_encolar_ready(t_pcb *pcb)
     free(algoritmo_planificacion);
     free(cola_algoritmos);
     free(preemption_str);
-    /* ================================================================ */
 
-    /* Semáforo READY arranca en 0 — se señaliza cuando hay proceso listo */
-    sem_init(&g_sem_ready, 0, 0);
+    sem_init(&g_sem_ready,      0, 0);
     sem_init(&g_sem_io_request, 0, 0);
 
+    /* ── Hilo worker de IO ── */
     pthread_t hilo_io_worker;
-    if (pthread_create(&hilo_io_worker, NULL, ks_io_worker, NULL) != 0) {
-        log_error(logger, "No se pudo crear el hilo worker de IO: %s", strerror(errno));
-    } else {
+    if (pthread_create(&hilo_io_worker, NULL, ks_io_worker, NULL) != 0)
+        log_error(logger, "No se pudo crear hilo worker IO: %s", strerror(errno));
+    else
         pthread_detach(hilo_io_worker);
-    }
+
+    /* Hilo de suspensión por timeout */
+    pthread_t hilo_suspension;
+    if (pthread_create(&hilo_suspension, NULL, ks_hilo_suspension, NULL) != 0)
+        log_error(logger, "No se pudo crear hilo de suspensión: %s", strerror(errno));
+    else
+        pthread_detach(hilo_suspension);
 
     log_info(logger, "Kernel Scheduler iniciando...");
 
-    /* Conectar a KM */
     char *ip_km     = config_get_string_value(config, "IP_KERNEL_MEMORY");
     int   puerto_km = config_get_int_value(config, "PUERTO_KERNEL_MEMORY");
     log_info(logger, "Conectando a Kernel Memory %s:%d...", ip_km, puerto_km);
-    
-    
-    /* ── Conectar a KM — UN SOLO SOCKET ── */
+
     fd_kernel_memory = conectar_a_servidor(logger, ip_km, puerto_km);
     free(ip_km);
     if (fd_kernel_memory == -1) {
@@ -1466,21 +1704,18 @@ void ks_encolar_ready(t_pcb *pcb)
     }
     if (!enviar_handshake(logger, fd_kernel_memory, TIPO_KS)) {
         log_error(logger, "Handshake fallo con Kernel Memory");
-        close(fd_kernel_memory);
-        config_destroy(config); log_destroy(logger); return 1;
+        close(fd_kernel_memory); config_destroy(config); log_destroy(logger); return 1;
     }
     log_info(logger, "## Conectado a Kernel Memory (fd=%d)", fd_kernel_memory);
 
-    /* Crear PID 0 */
     char *script = (argc > 2) ? argv[2] : "prueba";
     int32_t pid0 = 0, prio0 = 0;
 
-
     pthread_mutex_lock(&mutex_km_socket);
     t_paquete *paq = crear_paquete(OP_CREAR_PROCESO, logger);
-    agregar_a_paquete(paq, &pid0,   sizeof(int32_t));
-    agregar_a_paquete(paq, &prio0,  sizeof(int32_t));
-    agregar_a_paquete(paq, script,  strlen(script));
+    agregar_a_paquete(paq, &pid0,  sizeof(int32_t));
+    agregar_a_paquete(paq, &prio0, sizeof(int32_t));
+    agregar_a_paquete(paq, script, strlen(script));
     enviar_paquete(paq, fd_kernel_memory, logger);
     eliminar_paquete(paq);
 
@@ -1488,18 +1723,15 @@ void ks_encolar_ready(t_pcb *pcb)
     log_info(logger, "## (<0>) Se crea el proceso - Estado: NEW");
 
     int32_t resp_km;
-    if (ks_recibir_de_km(&resp_km) && resp_km == OP_OK) // ← antes: recibir_int32
+    if (ks_recibir_de_km(&resp_km) && resp_km == OP_OK)
         log_info(logger, "KM confirmo creacion de PID 0");
     else
         log_warning(logger, "KM no confirmo creacion de PID 0");
     pthread_mutex_unlock(&mutex_km_socket);
 
-    /* NEW → READY */
     ks_encolar_ready(pcb0);
-
     log_info(logger, "PID 0 en READY — script: %s, prioridad: %d", script, prio0);
 
-    /* Servidor CPUs/IOs (en otro hilo) */
     printf("SISTEMA LISTO - Esperando CPUs/IOs (puerto %d)...\n",
            config_get_int_value(config, "PUERTO_ESCUCHA"));
     log_info(logger, "A la espera de conexiones CPUs/IOs");
@@ -1516,3 +1748,5 @@ void ks_encolar_ready(t_pcb *pcb)
     log_destroy(logger);
     return 0;
 }
+
+

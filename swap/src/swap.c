@@ -140,8 +140,7 @@ bool swap_crear_archivo(const char *path, int32_t tamanio)
  * Hilo permanente que atiende los pedidos del KM.
  * ========================================================= */
  
-void swap_atender_km(void)
-{
+void swap_atender_km(void) {
     log_info(logger, "## Conectado a Kernel Memory — esperando operaciones");
  
     int32_t cod_op;
@@ -155,13 +154,13 @@ void swap_atender_km(void)
                     log_error(logger, "Error recibiendo numero de bloque (ESCRIBIR)");
                     goto desconectar;
                 }
- 
+
                 void *datos = malloc(g_block_size);
                 if (!datos) {
                     enviar_int32(fd_km, 901);
                     break;
                 }
- 
+
                 if (recv(fd_km, datos, g_block_size, MSG_WAITALL) != g_block_size) {
                     log_error(logger,
                               "Error recibiendo datos del bloque %d", numero_bloque);
@@ -169,11 +168,16 @@ void swap_atender_km(void)
                     enviar_int32(fd_km, 901);
                     break;
                 }
- 
+
                 bool ok = swap_escribir_bloque(numero_bloque, datos);
                 free(datos);
-                enviar_int32(fd_km, ok ? 900 : 901);
-                break;
+               if (!enviar_int32(fd_km, ok ? 900 : 901)) {
+                   log_error(logger,
+                             "Error enviando respuesta a KM para bloque %d — "
+                             "cerrando conexión", numero_bloque);
+                   goto desconectar;   // ← si no puede responder, el KM queda
+               }                      //   bloqueado igual; mejor cortar limpio
+               break;
             }
  
             /* ── LEER BLOQUE ── */
@@ -183,17 +187,30 @@ void swap_atender_km(void)
                     log_error(logger, "Error recibiendo numero de bloque (LEER)");
                     goto desconectar;
                 }
- 
+
                 void *datos = swap_leer_bloque(numero_bloque);
                 if (!datos) {
                     enviar_int32(fd_km, 901);
                     break;
                 }
- 
-                enviar_int32(fd_km, 900);
-                send(fd_km, datos, g_block_size, MSG_NOSIGNAL);
-                free(datos);
-                break;
+
+               if (!enviar_int32(fd_km, 900)) {
+                   log_error(logger,
+                             "Error enviando OK al KM para lectura bloque %d",
+                             numero_bloque);
+                   free(datos);
+                   goto desconectar;
+               }
+               ssize_t enviados = send(fd_km, datos, g_block_size, MSG_NOSIGNAL);
+               free(datos);
+               if (enviados != g_block_size) {
+                   log_error(logger,
+                             "Error enviando datos al KM para lectura bloque %d "
+                             "(enviados=%zd/%d)",
+                             numero_bloque, enviados, g_block_size);
+                   goto desconectar;
+               }
+               break;
             }
  
             /* ── LIBERAR BLOQUE (extensión recomendada) ── */
@@ -211,7 +228,9 @@ void swap_atender_km(void)
                     free(ceros);
                 }
                 log_info(logger, "## Bloque liberado: %d", numero_bloque);
-                enviar_int32(fd_km, 900);
+                if (!enviar_int32(fd_km, 900)) {
+                    log_error(logger, "Error enviando respuesta a KM");
+                }
                 break;
             }
  

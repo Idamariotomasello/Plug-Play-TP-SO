@@ -27,6 +27,8 @@ int         fd_swap_global  = -1;
 
 /* Estrategia de asignación */
 e_km_strategy g_strategy = KM_STRATEGY_BEST_FIT;
+
+int32_t g_swap_block_size = 0;   // se inicializa al conectar SWAP
  
 /* Contadores de conexiones */
 int g_cpus_conectadas = 0;
@@ -392,6 +394,8 @@ bool km_asignar_segmento(int32_t pid, int32_t seg_id, int32_t tam_seg)
     trozo->dir_fisica_ms = h->base;
     trozo->offset_seg    = 0;
     trozo->tamanio       = tam_seg;
+    trozo->en_swap = false;
+    trozo->num_bloques_swap = 0;
     seg.n_trozos = 1;
 
     h->base    += tam_seg;
@@ -420,7 +424,8 @@ void km_liberar_trozo(const t_trozo_segmento *trozo)
 {
 #ifdef TROZO_HAS_EN_SWAP
     if (trozo->en_swap) {
-        km_swap_liberar_bloque(trozo->dir_fisica_ms);
+        for (int i = 0; i < trozo->num_bloques_swap; i++)
+            km_swap_liberar_bloque(trozo->bloques_swap[i]);
         return;
     }
 #endif
@@ -496,6 +501,8 @@ void km_compactar(void)
                         if (buf) {
                             int fd = g_ms_lista[ms].fd;
  
+                            pthread_mutex_lock(&mutex_ms_ops[ms]);
+
                             /* Leer desde src */
                             enviar_int32(fd, 700 /* OP_LEER_MS */);
                             enviar_int32(fd, src);
@@ -505,12 +512,20 @@ void km_compactar(void)
                             recibir_int32(fd, &tam_r);
                             recv(fd, buf, tam_r, MSG_WAITALL);
  
+                            pthread_mutex_unlock(&mutex_ms_ops[ms]);
+
+                            trozo->dir_fisica_ms = dst;
+
+                            pthread_mutex_lock(&mutex_ms_ops[ms]);
+
                             /* Escribir en dst */
                             enviar_int32(fd, 701 /* OP_ESCRIBIR_MS */);
                             enviar_int32(fd, dst);
                             enviar_int32(fd, trozo->tamanio);
                             send(fd, buf, trozo->tamanio, MSG_NOSIGNAL);
                             recibir_int32(fd, &resp);
+
+                            pthread_mutex_unlock(&mutex_ms_ops[ms]);
  
                             free(buf);
                         }
@@ -584,7 +599,8 @@ void km_swap_liberar_bloque(int32_t bloque)
  * Envía OP_SWAP_ESCRIBIR_BLOQUE al módulo SWAP.
  * `tamanio` debe ser <= block_size; si es menor se rellena con '\0'.
  */
-bool km_swap_escribir(int32_t bloque, void *datos, int32_t tamanio)
+
+ bool km_swap_escribir(int32_t bloque, void *datos, int32_t tamanio)
 {
     pthread_mutex_lock(&mutex_fd_swap);
     int fd = fd_swap_global;
@@ -593,15 +609,29 @@ bool km_swap_escribir(int32_t bloque, void *datos, int32_t tamanio)
         log_error(g_logger, "SWAP: no conectado");
         return false;
     }
- 
-    enviar_int32(fd, 600 /* OP_SWAP_ESCRIBIR_BLOQUE */);
-    enviar_int32(fd, bloque);
-    send(fd, datos, tamanio, MSG_NOSIGNAL);
- 
+
+    if (!enviar_int32(fd, 600)) {
+        pthread_mutex_unlock(&mutex_fd_swap);
+        log_error(g_logger, "## SWAP: error enviando opcode escritura bloque %d", bloque);
+        return false;
+    }
+    if (!enviar_int32(fd, bloque)) {
+        pthread_mutex_unlock(&mutex_fd_swap);
+        log_error(g_logger, "## SWAP: error enviando numero de bloque %d", bloque);
+        return false;
+    }
+   ssize_t enviados = send(fd, datos, tamanio, MSG_NOSIGNAL);
+   if (enviados != tamanio) {
+       pthread_mutex_unlock(&mutex_fd_swap);
+       log_error(g_logger,
+                 "## SWAP: error enviando datos bloque %d (enviados=%zd/%d): %s",
+                 bloque, enviados, tamanio, strerror(errno));
+       return false;
+    }
     int32_t resp;
-    bool ok = recibir_int32(fd, &resp) && resp == 900 /* OP_OK */;
+    bool ok = recibir_int32(fd, &resp) && resp == 900;
     pthread_mutex_unlock(&mutex_fd_swap);
- 
+
     log_info(g_logger, "## Escritura del bloque: %d (%s)", bloque, ok ? "OK" : "ERROR");
     return ok;
 }
@@ -618,19 +648,34 @@ bool km_swap_leer(int32_t bloque, void *dest, int32_t tamanio)
         log_error(g_logger, "SWAP: no conectado");
         return false;
     }
- 
-    enviar_int32(fd, 601 /* OP_SWAP_LEER_BLOQUE */);
-    enviar_int32(fd, bloque);
- 
+
+    if (!enviar_int32(fd, 601)) {
+        pthread_mutex_unlock(&mutex_fd_swap);
+        log_error(g_logger, "## SWAP: error enviando opcode lectura bloque %d", bloque);
+        return false;
+    }
+    if (!enviar_int32(fd, bloque)) {
+        pthread_mutex_unlock(&mutex_fd_swap);
+        log_error(g_logger, "## SWAP: error enviando numero de bloque %d", bloque);
+        return false;
+    }
+
     int32_t resp;
     if (!recibir_int32(fd, &resp) || resp != 900) {
         pthread_mutex_unlock(&mutex_fd_swap);
+       log_error(g_logger,
+                 "## SWAP: respuesta inesperada en lectura bloque %d (resp=%d)",
+                 bloque, resp);
         return false;
     }
     ssize_t leidos = recv(fd, dest, tamanio, MSG_WAITALL);
     pthread_mutex_unlock(&mutex_fd_swap);
- 
+
     bool ok = (leidos == tamanio);
+   if (!ok)
+       log_error(g_logger,
+                 "## SWAP: error recibiendo datos bloque %d (leidos=%zd/%d): %s",
+                 bloque, leidos, tamanio, strerror(errno));
     log_info(g_logger, "## Lectura del bloque: %d (%s)", bloque, ok ? "OK" : "ERROR");
     return ok;
 }
@@ -642,52 +687,104 @@ bool km_swap_leer(int32_t bloque, void *dest, int32_t tamanio)
  * Mueve todos los segmentos del proceso a SWAP.
  * Por cada trozo: reserva bloque, escribe datos en swap, libera espacio en MS.
  */
+
 void km_suspender_proceso(int fd_ks, int32_t pid)
 {
     log_info(g_logger, "## PID: %d - Suspendiendo proceso (moviendo a SWAP)", pid);
- 
+
     pthread_mutex_lock(&mutex_procesos);
- 
+
     for (int i = 0; i < KM_MAX_PROCESOS; i++) {
         if (!g_procesos[i].activo || g_procesos[i].pid != pid) continue;
- 
+
         for (int s = 0; s < g_procesos[i].n_segmentos; s++) {
             t_segmento *seg = &g_procesos[i].segmentos[s];
             if (!seg->activo) continue;
- 
+
             for (int t = 0; t < seg->n_trozos; t++) {
                 t_trozo_segmento *trozo = &seg->trozos[t];
-#ifdef TROZO_HAS_EN_SWAP
                 if (trozo->en_swap) continue;
-#endif
-                /* Leer datos del MS */
+
                 void *buf = malloc(trozo->tamanio);
-                if (!buf) continue;
- 
+               if (!buf) {
+                   log_error(g_logger,
+                       "## PID: %d - malloc falló para trozo %d", pid, t);
+                   goto suspender_error;   // ← responde OP_ERROR al KS
+               }
+
                 int fd_ms = g_ms_lista[trozo->ms_id].fd;
-                enviar_int32(fd_ms, 700 /* OP_LEER_MS */);
+
+                pthread_mutex_lock(&mutex_ms_ops[trozo->ms_id]);
+                enviar_int32(fd_ms, 700);
                 enviar_int32(fd_ms, trozo->dir_fisica_ms);
                 enviar_int32(fd_ms, trozo->tamanio);
                 int32_t resp, tam_r;
                 recibir_int32(fd_ms, &resp);
                 recibir_int32(fd_ms, &tam_r);
                 recv(fd_ms, buf, tam_r, MSG_WAITALL);
- 
-                /* Reservar bloque en SWAP y escribir */
-                pthread_mutex_unlock(&mutex_procesos);
-                int32_t bloque = km_swap_reservar_bloque();
-                bool ok = (bloque != -1) && km_swap_escribir(bloque, buf, trozo->tamanio);
-                pthread_mutex_lock(&mutex_procesos);
-                free(buf);
- 
-                if (!ok) {
-                    log_error(g_logger,
-                              "## PID: %d - Error moviendo trozo a SWAP (seg=%d trozo=%d)",
-                              pid, s, t);
-                    continue;
+                pthread_mutex_unlock(&mutex_ms_ops[trozo->ms_id]);
+
+                int32_t block_size = g_swap_block_size;
+                int32_t num_bloques = (trozo->tamanio + block_size - 1) / block_size;
+                int32_t bloques_reservados[MAX_BLOQUES_SWAP_POR_TROZO];
+                memset(bloques_reservados, -1, sizeof(bloques_reservados));
+                bool ok = true;
+
+                for (int b = 0; b < num_bloques; b++) {
+                    int32_t bloque = km_swap_reservar_bloque();
+                    if (bloque == -1) {
+                        ok = false;
+                        break;
+                    }
+                    bloques_reservados[b] = bloque;
                 }
- 
-                /* Liberar espacio en MS */
+
+                if (!ok) {
+                    for (int b = 0; b < num_bloques; b++)
+                       if (b < num_bloques && bloques_reservados[b] != -1)
+                            km_swap_liberar_bloque(bloques_reservados[b]);
+                    log_error(g_logger,
+                        "## PID: %d - Error reservando bloques swap", pid);
+                    free(buf);
+                   
+                   goto suspender_error;
+                }
+
+                for (int b = 0; b < num_bloques; b++) {
+                    int32_t offset = b * block_size;
+                    int32_t tam_fragmento = (b == num_bloques - 1) ?
+                                            (trozo->tamanio - offset) : block_size;
+                    void *frag_buf = calloc(1, block_size);
+                    if (!frag_buf) {
+                        ok = false;
+                        log_error(g_logger,
+                                  "## PID: %d - calloc falló bloque %d", pid, b);
+                        break;
+                    }
+                    memcpy(frag_buf, (char*)buf + offset, tam_fragmento);
+                    if (!km_swap_escribir(bloques_reservados[b], frag_buf, block_size)) {
+                        free(frag_buf);
+                        ok = false;
+                        log_error(g_logger,
+                                  "## PID: %d - km_swap_escribir falló en bloque %d",
+                                  pid, b);
+                        break;
+                    }
+                    free(frag_buf);
+                }
+
+                free(buf);   // ← única liberación, siempre acá independiente de ok
+
+                if (!ok) {
+                    for (int b = 0; b < num_bloques; b++)
+                        if (bloques_reservados[b] != -1)
+                            km_swap_liberar_bloque(bloques_reservados[b]);
+                    log_error(g_logger,
+                              "## PID: %d - Error escribiendo en swap", pid);
+                    goto suspender_error;
+                }
+
+                // A partir de acá: ok == true, buf ya liberado, continuar con el trozo
                 t_hueco h = {
                     .activo  = true,
                     .ms_id   = trozo->ms_id,
@@ -697,31 +794,35 @@ void km_suspender_proceso(int fd_ks, int32_t pid)
                 pthread_mutex_lock(&mutex_huecos);
                 km_hueco_agregar(&h);
                 pthread_mutex_unlock(&mutex_huecos);
- 
                 int ms_id_viejo = trozo->ms_id;
- 
-                /* Actualizar trozo: ahora vive en swap */
-#ifdef TROZO_HAS_EN_SWAP
-                trozo->en_swap       = true;
-                trozo->ms_id         = -1;
-                trozo->dir_fisica_ms = bloque;
-                trozo->activo        = true;
-#else
-                trozo->ms_id         = -1;  /* convención: -1 = swap */
-                trozo->dir_fisica_ms = bloque;
-#endif
+
+                trozo->en_swap = true;
+                trozo->ms_id = -1;
+                trozo->dir_fisica_ms = bloques_reservados[0];
+                trozo->num_bloques_swap = num_bloques;
+                for (int b = 0; b < num_bloques; b++)
+                    trozo->bloques_swap[b] = bloques_reservados[b];
+
                 km_mergear_huecos(ms_id_viejo);
             }
         }
         break;
     }
- 
+
     pthread_mutex_unlock(&mutex_procesos);
- 
-    enviar_int32(fd_ks, 900 /* OP_OK */);
+   /* Camino exitoso: siempre responde OK */
+    enviar_int32(fd_ks, OP_OK);
     log_info(g_logger, "## PID: %d - Proceso suspendido", pid);
+   return;
+
+suspender_error:
+   /* Camino de error: SIEMPRE responde para no bloquear al KS */
+   pthread_mutex_unlock(&mutex_procesos);
+   log_error(g_logger,
+       "## PID: %d - Suspensión abortada — respondiendo OP_ERROR al KS", pid);
+   enviar_int32(fd_ks, OP_ERROR);
 }
- 
+
 /* km_dessuspender_proceso
  * Restaura todos los segmentos desde SWAP a la memoria principal.
  * Usa la estrategia de búsqueda de huecos configurada.
@@ -734,76 +835,102 @@ void km_dessuspender_proceso(int fd_ks, int32_t pid)
  
     for (int i = 0; i < KM_MAX_PROCESOS; i++) {
         if (!g_procesos[i].activo || g_procesos[i].pid != pid) continue;
- 
+
         for (int s = 0; s < g_procesos[i].n_segmentos; s++) {
             t_segmento *seg = &g_procesos[i].segmentos[s];
             if (!seg->activo) continue;
- 
+
             for (int t = 0; t < seg->n_trozos; t++) {
                 t_trozo_segmento *trozo = &seg->trozos[t];
- 
-#ifdef TROZO_HAS_EN_SWAP
                 if (!trozo->en_swap) continue;
-#else
-                if (trozo->ms_id != -1) continue;
-#endif
-                int32_t bloque = trozo->dir_fisica_ms;
- 
-                /* Buscar hueco en memoria principal */
+
+                int32_t tamanio_total = trozo->tamanio;
+                int32_t num_bloques = trozo->num_bloques_swap;
+                
+
+                // 1. Buscar hueco en MS para el trozo completo
                 pthread_mutex_lock(&mutex_huecos);
-                t_hueco *h = km_buscar_hueco(trozo->tamanio);
+                t_hueco *h = km_buscar_hueco(tamanio_total);
                 if (!h) {
                     pthread_mutex_unlock(&mutex_huecos);
-                    log_error(g_logger,
-                              "## PID: %d - Sin espacio para des-suspender seg=%d trozo=%d",
-                              pid, s, t);
+                    log_error(g_logger, "## PID: %d - Sin espacio para des-suspender", pid);
                     continue;
                 }
- 
-                int32_t nueva_dir  = h->base;
-                int32_t nuevo_ms   = h->ms_id;
-                h->base    += trozo->tamanio;
-                h->tamanio -= trozo->tamanio;
+                int32_t nueva_dir = h->base;
+                int32_t nuevo_ms = h->ms_id;
+                h->base += tamanio_total;
+                h->tamanio -= tamanio_total;
                 if (h->tamanio == 0) h->activo = false;
                 pthread_mutex_unlock(&mutex_huecos);
- 
-                /* Leer desde SWAP */
-                void *buf = malloc(trozo->tamanio);
-                if (!buf) continue;
- 
-                pthread_mutex_unlock(&mutex_procesos);
-                bool ok = km_swap_leer(bloque, buf, trozo->tamanio);
-                pthread_mutex_lock(&mutex_procesos);
- 
-                if (ok) {
-                    /* Escribir en MS */
-                    int fd_ms = g_ms_lista[nuevo_ms].fd;
-                    enviar_int32(fd_ms, 701 /* OP_ESCRIBIR_MS */);
-                    enviar_int32(fd_ms, nueva_dir);
-                    enviar_int32(fd_ms, trozo->tamanio);
-                    send(fd_ms, buf, trozo->tamanio, MSG_NOSIGNAL);
-                    int32_t resp;
-                    recibir_int32(fd_ms, &resp);
+
+                // 2. Leer bloques swap y escribir en MS
+                bool ok = true;
+                int32_t escritos = 0;
+                int32_t block_size = g_swap_block_size;
+
+                for (int b = 0; b < num_bloques; b++) {
+                    int32_t bloque = trozo->bloques_swap[b];
+                    int32_t tam_fragmento = (b == num_bloques - 1) ?
+                                            (tamanio_total - escritos) : block_size;
+
+                    void *buf = malloc(block_size);
+                    if (!buf) { ok = false; break; }
+                    if (!km_swap_leer(bloque, buf, block_size)) {
+                        free(buf);
+                        ok = false;
+                        break;
+                    }
+
+                    // Escribir solo los bytes relevantes
+                    if (tam_fragmento > 0) {
+                        int fd_ms = g_ms_lista[nuevo_ms].fd;
+
+                        pthread_mutex_lock(&mutex_ms_ops[nuevo_ms]);
+
+                        enviar_int32(fd_ms, OP_ESCRIBIR_MS);
+                        enviar_int32(fd_ms, nueva_dir + escritos);
+                        enviar_int32(fd_ms, tam_fragmento);
+                       ssize_t env = send(fd_ms, buf, tam_fragmento, MSG_NOSIGNAL);
+                        int32_t resp;
+                       if (env != tam_fragmento) {
+                           log_error(g_logger,
+                                     "## PID: %d - send a MS falló (env=%zd/%d) bloque %d",
+                                     pid, env, tam_fragmento, b);
+                           pthread_mutex_unlock(&mutex_ms_ops[nuevo_ms]);
+                           free(buf);
+                           ok = false;
+                           break;
+                       }
+                        recibir_int32(fd_ms, &resp);
+
+                        pthread_mutex_unlock(&mutex_ms_ops[nuevo_ms]);
+
+                        if (resp != OP_OK) { ok = false; free(buf); break; }
+                    }
+                    free(buf);
+                    escritos += tam_fragmento;
                 }
-                free(buf);
- 
-                /* Liberar bloque swap */
-                km_swap_liberar_bloque(bloque);
- 
-                /* Actualizar trozo */
-#ifdef TROZO_HAS_EN_SWAP
-                trozo->en_swap       = false;
-#endif
-                trozo->ms_id         = nuevo_ms;
+
+                // 3. Liberar bloques swap (todos, aunque haya fallo parcial)
+                for (int b = 0; b < num_bloques; b++)
+                    km_swap_liberar_bloque(trozo->bloques_swap[b]);
+
+                if (!ok) {
+                    log_error(g_logger, "## PID: %d - Error restaurando desde swap", pid);
+                    continue;
+                }
+
+                // 4. Actualizar trozo: ya no está en swap
+                trozo->en_swap = false;
+                trozo->ms_id = nuevo_ms;
                 trozo->dir_fisica_ms = nueva_dir;
+                trozo->num_bloques_swap = 0;
             }
         }
         break;
     }
- 
     pthread_mutex_unlock(&mutex_procesos);
- 
-    enviar_int32(fd_ks, 900 /* OP_OK */);
+    enviar_int32(fd_ks, OP_OK);
     log_info(g_logger, "## PID: %d - Proceso des-suspendido", pid);
 }
 
@@ -912,6 +1039,9 @@ void km_leer_datos(int fd_ks, int32_t pid, int32_t dir_logica, int32_t tamanio)
     if (!buf) { enviar_int32(fd_ks, 901); return; }
  
     int fd_ms = g_ms_lista[ms_id].fd;
+
+    pthread_mutex_lock(&mutex_ms_ops[ms_id]);
+
     enviar_int32(fd_ms, 700 /* OP_LEER_MS */);
     enviar_int32(fd_ms, dir_fisica);
     enviar_int32(fd_ms, tamanio);
@@ -920,6 +1050,8 @@ void km_leer_datos(int fd_ks, int32_t pid, int32_t dir_logica, int32_t tamanio)
     recibir_int32(fd_ms, &resp);
     recibir_int32(fd_ms, &tam_r);
     recv(fd_ms, buf, tam_r, MSG_WAITALL);
+
+    pthread_mutex_unlock(&mutex_ms_ops[ms_id]);
  
     log_info(g_logger, "## PID: %d - Lectura - Dir. Física: %d - Tamaño: %d",
              pid, dir_fisica, tamanio);
@@ -949,6 +1081,9 @@ void km_escribir_datos(int fd_ks, int32_t pid, int32_t dir_logica,
     }
  
     int fd_ms = g_ms_lista[ms_id].fd;
+
+    pthread_mutex_lock(&mutex_ms_ops[ms_id]);
+
     enviar_int32(fd_ms, 701 /* OP_ESCRIBIR_MS */);
     enviar_int32(fd_ms, dir_fisica);
     enviar_int32(fd_ms, tamanio);
@@ -956,6 +1091,8 @@ void km_escribir_datos(int fd_ks, int32_t pid, int32_t dir_logica,
  
     int32_t resp;
     recibir_int32(fd_ms, &resp);
+
+    pthread_mutex_unlock(&mutex_ms_ops[ms_id]);
  
     log_info(g_logger, "## PID: %d - Escritura - Dir. Física: %d - Tamaño: %d",
              pid, dir_fisica, tamanio);
@@ -1574,6 +1711,8 @@ void km_atender_swap(t_log *logger, int fd_swap)
         log_error(logger, "Error recibiendo parámetros de SWAP");
         close(fd_swap); return;
     }
+
+    g_swap_block_size = block_size;
  
     int32_t bloques_totales = (block_size > 0) ? swap_size / block_size : 0;
  

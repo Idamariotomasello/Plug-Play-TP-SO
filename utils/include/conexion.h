@@ -29,6 +29,7 @@ void saludar(char* quien);
 #define MAX_SEGMENTOS   64
 #define MAX_MS          16   /* máximo de Memory Sticks simultáneos */
 #define KS_MAX_MUTEX 32
+#define MAX_BLOQUES_SWAP_POR_TROZO 1024
 
 extern t_log *logger;
 extern t_config *config;
@@ -45,6 +46,7 @@ extern pthread_mutex_t mutex_km_socket;
 extern pthread_mutex_t mutex_huecos;
 extern pthread_mutex_t mutex_fd_ks;
 extern pthread_mutex_t mutex_fd_swap;
+extern pthread_mutex_t mutex_ms_ops[MAX_MS];
 extern sem_t g_sem_listo;
 
 
@@ -182,6 +184,8 @@ typedef struct {
     int32_t  offset_seg;     // offset dentro del segmento lógico
     int32_t  tamanio;        // bytes del trozo
     bool     en_swap;        // true si el trozo está en swap
+    int32_t num_bloques_swap; // cantidad de bloques swap utilizados
+    int32_t bloques_swap[MAX_BLOQUES_SWAP_POR_TROZO];
 } t_trozo_segmento;
 
 typedef struct {
@@ -225,6 +229,9 @@ typedef struct s_pcb {
     int     fd_cpu_asignada;   // fd de la CPU que lo ejecuta actualmente
     uint32_t syscall_val1;
     uint32_t syscall_val2;
+    struct timespec tiempo_block_inicio;
+    bool suspension_en_curso; 
+    bool dessuspender_al_terminar; // si true, al terminar de ejecutar se pasa a SUSP_READY
 } t_pcb;
 
 typedef struct s_proceso_esperando {

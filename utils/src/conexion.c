@@ -11,6 +11,7 @@ pthread_mutex_t mutex_interrupcion_pendiente = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_km_socket = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_huecos    = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t mutex_fd_swap   = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t mutex_ms_ops[MAX_MS] = { PTHREAD_MUTEX_INITIALIZER };
 
 sem_t g_sem_listo;
 sem_t sem_km_cpu;
@@ -38,6 +39,8 @@ void inicializar_sincronizacion() {
     pthread_mutex_init(&mutex_km_socket, NULL);
     pthread_mutex_init(&mutex_huecos, NULL);
     pthread_mutex_init(&mutex_fd_swap, NULL);
+    for (int i = 0; i < MAX_MS; i++)    
+        pthread_mutex_init(&mutex_ms_ops[i], NULL);
 }
 
 void destruir_sincronizacion() {
