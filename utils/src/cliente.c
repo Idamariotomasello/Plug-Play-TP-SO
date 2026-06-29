@@ -1,7 +1,6 @@
 #include "cliente.h"
 
 
-
 int crear_conexion(t_log* logger, char *ip, int puerto)
 {
 	log_info(logger, "Creando conexion con el servidor %s:%d", ip, puerto);
@@ -48,7 +47,6 @@ int crear_conexion(t_log* logger, char *ip, int puerto)
 
 	return socket_cliente;
 }
-
 
 
 bool enviar_int32(int fd, int32_t valor)

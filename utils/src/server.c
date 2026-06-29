@@ -7,10 +7,9 @@
 
 #include "server.h"
 
-/* =========================================================
- * iniciar_servidor
+/* iniciar_servidor
  * Crea socket, bind, listen. Devuelve fd_escucha o -1.
- * ========================================================= */
+ */
 
 int iniciar_servidor(t_log *logger, int puerto)
 {
@@ -64,10 +63,9 @@ int iniciar_servidor(t_log *logger, int puerto)
     return fd;
 }
 
-/* =========================================================
- * esperar_cliente
+/* esperar_cliente
  * Bloquea hasta que llega una conexión. Devuelve fd_cliente o -1.
- * ========================================================= */
+ */
 
 int esperar_cliente(t_log *logger, int fd_escucha)
 {
@@ -77,10 +75,9 @@ int esperar_cliente(t_log *logger, int fd_escucha)
     return fd_cliente;
 }
 
-/* =========================================================
- * conectar_a_servidor
+/* conectar_a_servidor
  * Crea socket y conecta a ip:puerto. Devuelve fd o -1.
- * ========================================================= */
+ */
 
 int conectar_a_servidor(t_log *logger, const char *ip, int puerto)
 {
@@ -122,10 +119,9 @@ int conectar_a_servidor(t_log *logger, const char *ip, int puerto)
     return fd;
 }
 
-/* =========================================================
- * enviar_handshake / recibir_handshake
+/* enviar_handshake / recibir_handshake
  * El cliente envía su tipo; el servidor responde OK o ERR.
- * ========================================================= */
+ */
 
 bool enviar_handshake(t_log *logger, int fd, int32_t tipo_modulo)
 {
@@ -167,9 +163,7 @@ int32_t recibir_handshake(t_log *logger, int fd)
     return tipo;
 }
 
-/* =========================================================
- * Primitivos de send / recv
- * ========================================================= */
+/* Primitivos de send / recv */
 
 bool recibir_int32(int fd, int32_t *dest)
 {

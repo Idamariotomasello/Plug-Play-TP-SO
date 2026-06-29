@@ -23,9 +23,7 @@ bool usar_doble_conexion_kernel_scheduler = false;
 bool enviar_syscall_extendida = false;
 int32_t g_segment_max_size = 0;  /* Será configurado por Kernel Memory */
  
-/* =========================================================
- * Helpers de registros
- * ========================================================= */
+/* Helpers de registros */
 
 uint32_t cpu_leer_registro(t_registros *r, const char *n)
 {
@@ -256,7 +254,6 @@ bool cpu_escribir_memoria(t_contexto *ctx, uint32_t dir_logica,
     log_info(logger, "## PID: %d - ESCRIBIR completado (%d bytes)", ctx->pid, escritos);
     return escritos == tamanio;
 }
-
 
 
 void cpu_limpiar_syscall(t_syscall_pendiente *syscall)
@@ -629,11 +626,10 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
     return true;
 }
  
-/* =========================================================
- * hilo_interrupciones
+/* hilo_interrupciones
  * Escucha interrupciones asíncronas del KS sobre fd_kernel_scheduler_interrupt.
  * Las almacena en interrupcion_pendiente protegido por mutex_interrupcion_pendiente.
- * ========================================================= */
+ */
  
 void *hilo_interrupciones(void *arg)
 {
@@ -923,3 +919,4 @@ cleanup:
     log_destroy(logger);
     return 0;
 }
+

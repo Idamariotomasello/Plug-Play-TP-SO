@@ -3,15 +3,12 @@
 
 #include "conexion.h"
 
-/* =========================================================
- * Constantes globales
- * ========================================================= */
+/* Constantes globales */
  
 #define MAX_BUFFER    (10 * 1024 * 1024)  /* 10 MB */
  
 #define HANDSHAKE_OK   0
 #define HANDSHAKE_ERR -1
-
 
 
 typedef struct
@@ -21,9 +18,7 @@ typedef struct
 } t_servidor_arg;
  
  
-/* =========================================================
- * API genérica de red
- * ========================================================= */
+/* API genérica de red */
  
 /* Servidor */
 int     iniciar_servidor(t_log *logger, int puerto);

@@ -2,9 +2,7 @@
 #include <cliente.h>
 #include <server.h>
 
-/* =========================================================
- * Globales del módulo
- * ========================================================= */
+/* Globales del módulo */
  
 t_log    *logger = NULL;
 t_config *config = NULL;
@@ -15,11 +13,10 @@ int32_t g_block_size = 0;   /* BLOCK_SIZE del config */
 int32_t g_swap_size = 0;    /* SWAP_FILE_SIZE del config */
 int32_t  g_swap_bloques_totales = 0;
  
-/* =========================================================
- * swap_escribir_bloque
+/* swap_escribir_bloque
  * Escribe exactamente g_block_size bytes en el bloque
  * indicado por numero_bloque (base 0).
- * ========================================================= */
+ */
  
 bool swap_escribir_bloque(int32_t numero_bloque, void *datos)
 {
@@ -55,11 +52,10 @@ bool swap_escribir_bloque(int32_t numero_bloque, void *datos)
     return true;
 }
  
-/* =========================================================
- * swap_leer_bloque
+/* swap_leer_bloque
  * Lee exactamente g_block_size bytes desde el bloque indicado.
  * Devuelve buffer malloc'd que el caller debe liberar, o NULL.
- * ========================================================= */
+ */
  
 void *swap_leer_bloque(int32_t numero_bloque)
 {
@@ -97,9 +93,7 @@ void *swap_leer_bloque(int32_t numero_bloque)
     return buf;
 }
 
-/* =========================================================
- * swap_crear_archivo
- * ========================================================= */
+/* swap_crear_archivo */
  
 bool swap_crear_archivo(const char *path, int32_t tamanio)
 {
@@ -135,10 +129,9 @@ bool swap_crear_archivo(const char *path, int32_t tamanio)
     return true;
 }
 
-/* =========================================================
- * swap_atender_km
+/* swap_atender_km
  * Hilo permanente que atiende los pedidos del KM.
- * ========================================================= */
+ */
  
 void swap_atender_km(void) {
     log_info(logger, "## Conectado a Kernel Memory — esperando operaciones");
@@ -251,9 +244,7 @@ desconectar:
 }
 
 
-/* =========================================================
- * main
- * ========================================================= */
+/* main */
  
 int main(int argc, char *argv[])
 {

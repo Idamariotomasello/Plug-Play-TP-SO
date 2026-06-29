@@ -3,9 +3,7 @@
 #include <server.h>
 #include <ctype.h>
 
-/* =========================================================
- * Globales del módulo
- * ========================================================= */
+/* Globales del módulo */
 
 t_log    *logger          = NULL;
 t_config *config          = NULL;
@@ -45,7 +43,7 @@ t_cola_ready_local g_cmn_colas[KS_MAX_PRIORIDADES];
 e_algoritmo        g_cmn_algoritmos[KS_MAX_PRIORIDADES];
 int32_t            g_cmn_cantidad_colas = 0;
 
-static char *ks_trim(char *s)
+char *ks_trim(char *s)
 {
     while (*s && isspace((unsigned char)*s)) s++;
 
@@ -56,7 +54,7 @@ static char *ks_trim(char *s)
     return s;
 }
 
-static const char *ks_nombre_algoritmo_corto(e_algoritmo algoritmo)
+const char *ks_nombre_algoritmo_corto(e_algoritmo algoritmo)
 {
     switch (algoritmo) {
         case ALGO_FIFO: return "FIFO";
@@ -66,7 +64,7 @@ static const char *ks_nombre_algoritmo_corto(e_algoritmo algoritmo)
     }
 }
 
-static bool ks_parse_algoritmo_cola(const char *token, e_algoritmo *out)
+bool ks_parse_algoritmo_cola(const char *token, e_algoritmo *out)
 {
     if (!strcmp(token, "FIFO")) {
         *out = ALGO_FIFO;
@@ -81,7 +79,7 @@ static bool ks_parse_algoritmo_cola(const char *token, e_algoritmo *out)
     return false;
 }
 
-static void ks_inicializar_colas_cmn(void)
+void ks_inicializar_colas_cmn(void)
 {
     g_cmn_cantidad_colas = 0;
     for (int i = 0; i < KS_MAX_PRIORIDADES; i++) {
@@ -91,7 +89,7 @@ static void ks_inicializar_colas_cmn(void)
     }
 }
 
-static bool ks_configurar_colas_cmn(const char *config_colas)
+bool ks_configurar_colas_cmn(const char *config_colas)
 {
     ks_inicializar_colas_cmn();
 
@@ -143,12 +141,12 @@ static bool ks_configurar_colas_cmn(const char *config_colas)
     return true;
 }
 
-static bool ks_prioridad_valida_cmn(int32_t prioridad)
+bool ks_prioridad_valida_cmn(int32_t prioridad)
 {
     return prioridad >= 0 && prioridad < g_cmn_cantidad_colas;
 }
 
-static e_algoritmo ks_algoritmo_efectivo_pcb(t_pcb *pcb)
+e_algoritmo ks_algoritmo_efectivo_pcb(t_pcb *pcb)
 {
     if (g_algoritmo != ALGO_CMN)
         return g_algoritmo;
@@ -159,7 +157,7 @@ static e_algoritmo ks_algoritmo_efectivo_pcb(t_pcb *pcb)
     return g_cmn_algoritmos[pcb->prioridad];
 }
 
-static void ks_evaluar_desalojo_cmn(t_pcb *pcb_nuevo)
+void ks_evaluar_desalojo_cmn(t_pcb *pcb_nuevo)
 {
     if (g_algoritmo != ALGO_CMN || !g_preemption || !pcb_nuevo)
         return;
@@ -216,8 +214,6 @@ static void ks_evaluar_desalojo_cmn(t_pcb *pcb_nuevo)
 
 /* Semáforo: hay proceso READY para despachar a una CPU */
 sem_t g_sem_ready;
-
-
 
 
 void ks_init_mutexes(void)
@@ -413,9 +409,7 @@ void ks_syscall_mutex_unlock(t_pcb *pcb, const char *nombre)
 }
 
 
-/* =========================================================
- * Helpers de estado
- * ========================================================= */
+/* Helpers de estado */
 
 const char *ks_nombre_estado(e_estado_proceso e)
 {
@@ -444,9 +438,7 @@ void ks_cambiar_estado(t_pcb *pcb, e_estado_proceso nuevo)
         clock_gettime(CLOCK_MONOTONIC, &pcb->tiempo_block_inicio);
 }
 
-/* =========================================================
- * Gestión de PCBs del planificador
- * ========================================================= */
+/* Gestión de PCBs del planificador */
 
 t_pcb *ks_crear_pcb(int32_t pid, int32_t prioridad)
 {
@@ -492,9 +484,7 @@ t_pcb *ks_primer_ready(void)
     return pcb;
 }
 
-/* =========================================================
- * Registro de dispositivos IO
- * ========================================================= */
+/* Registro de dispositivos IO */
 
 void ks_registrar_io(int fd, int32_t subtipo)
 {
@@ -557,7 +547,7 @@ t_io_request *g_io_queue_tail = NULL;
 pthread_mutex_t g_mutex_io_queue = PTHREAD_MUTEX_INITIALIZER;
 sem_t g_sem_io_request;
 
-static t_io_request *ks_io_request_crear(int32_t pid, int32_t subtipo,
+t_io_request *ks_io_request_crear(int32_t pid, int32_t subtipo,
                                          const void *param, int32_t param_size,
                                          uint32_t dir_logica, int32_t tamanio)
 {
@@ -582,14 +572,14 @@ static t_io_request *ks_io_request_crear(int32_t pid, int32_t subtipo,
     return req;
 }
 
-static void ks_io_request_destruir(t_io_request *req)
+void ks_io_request_destruir(t_io_request *req)
 {
     if (!req) return;
     free(req->param);
     free(req);
 }
 
-static void ks_io_request_enqueuar(t_io_request *req)
+void ks_io_request_enqueuar(t_io_request *req)
 {
     pthread_mutex_lock(&g_mutex_io_queue);
     if (g_io_queue_tail) {
@@ -602,7 +592,7 @@ static void ks_io_request_enqueuar(t_io_request *req)
     sem_post(&g_sem_io_request);
 }
 
-static t_io_request *ks_io_request_dequeuar(void)
+t_io_request *ks_io_request_dequeuar(void)
 {
     sem_wait(&g_sem_io_request);
     pthread_mutex_lock(&g_mutex_io_queue);
@@ -804,8 +794,7 @@ void *ks_io_worker(void *arg)
 }
 
 
-/*
- * ks_suspender_proceso
+/* ks_suspender_proceso
  * Envía OP_SUSPENDER_PROCESO al KM y cambia el estado del PCB.
  * Debe llamarse SIN mutex_km_socket tomado.
  */
@@ -831,8 +820,7 @@ bool ks_suspender_proceso(t_pcb *pcb)
     return ok;
 }
 
-/*
- * ks_dessuspender_proceso
+/* ks_dessuspender_proceso
  * Envía OP_DESSUSPENDER_PROCESO al KM para restaurar memoria desde SWAP.
  * Debe llamarse SIN mutex_km_socket tomado.
  */
@@ -966,12 +954,11 @@ void *ks_hilo_suspension(void *arg)
 }
 
 
-/* =========================================================
- * ks_recibir_de_km
+/* ks_recibir_de_km
  * Lee un int32 del socket KM descartando ciertos opcodes
  * y procesando eventos de compactación.
  * DEBE llamarse con mutex_km_socket ya tomado.
- * ========================================================= */
+ */
 bool ks_recibir_de_km(int32_t *out)
 {
     while (recibir_int32(fd_kernel_memory, out)) {
@@ -1093,10 +1080,9 @@ bool ks_escribir_datos(int32_t pid, int32_t dir_logica, int32_t tamanio, void *d
     return ok;
 }
 
-/* =========================================================
- * Procesamiento de syscall recibida desde la CPU
+/* Procesamiento de syscall recibida desde la CPU
  * Parsea la instrucción del PCB y despacha al dispositivo correcto.
- * ========================================================= */
+ */
 
 void ks_procesar_syscall(t_pcb *pcb)
 {
@@ -1377,11 +1363,10 @@ void ks_procesar_syscall(t_pcb *pcb)
     }
 }
 
-/* =========================================================
- * atender_cliente_ks
+/* atender_cliente_ks
  * Hilo por conexión: identifica tipo (CPU / IO) y actúa.
  * Para la CPU: planificador simplificado FIFO.
- * ========================================================= */
+ */
 
 typedef struct {
     t_pcb  *pcb;
@@ -1490,9 +1475,7 @@ void *atender_cliente_ks(void *varg)
         log_info(logger, "## CPU %d Conectada (fd=%d)", id_cpu, fd);
 
 
-        /*
-         * Loop planificador:
-         */
+        /* Loop planificador: */
         while (1)
         {
             /* Bloquear hasta que haya proceso READY */
@@ -1698,9 +1681,7 @@ void *atender_cliente_ks(void *varg)
 
 
 
-/* =========================================================
- * Accept loop para CPUs e IOs
- * ========================================================= */
+/* Accept loop para CPUs e IOs */
 
 void iniciar_servidor_puerto_escucha(void)
 {
@@ -2059,5 +2040,4 @@ int main(int argc, char *argv[])
     log_destroy(logger);
     return 0;
 }
-
 

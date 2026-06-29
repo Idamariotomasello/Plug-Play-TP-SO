@@ -2,9 +2,7 @@
 #include <cliente.h>
 #include <server.h>
 
-/* =========================================================
- * Globales del módulo
- * ========================================================= */
+/* Globales del módulo */
  
 t_log    *logger = NULL;
 t_config *config = NULL;
@@ -15,11 +13,10 @@ int     g_memory_delay = 0;   /* MEMORY_DELAY en ms */
 int     fd_km         = -1;   /* socket hacia Kernel Memory */
  
 
-/* =========================================================
- * ms_leer
+/* ms_leer
  * Lee g_memory_delay ms, luego copia 'tamanio' bytes
  * desde g_memoria[dir_fisica] al buffer de salida.
- * ========================================================= */
+ */
  
 bool ms_leer(int32_t dir_fisica, int32_t tamanio, void *dest)
 {
@@ -38,11 +35,10 @@ bool ms_leer(int32_t dir_fisica, int32_t tamanio, void *dest)
     return true;
 }
  
-/* =========================================================
- * ms_escribir
+/* ms_escribir
  * Espera g_memory_delay ms, luego copia 'tamanio' bytes
  * desde src a g_memoria[dir_fisica].
- * ========================================================= */
+ */
  
 bool ms_escribir(int32_t dir_fisica, int32_t tamanio, void *src)
 {
@@ -61,10 +57,9 @@ bool ms_escribir(int32_t dir_fisica, int32_t tamanio, void *src)
     return true;
 }
 
-/* =========================================================
- * ms_atender_km
+/* ms_atender_km
  * Bucle principal que atiende los comandos del Kernel Memory.
- * ========================================================= */
+ */
 void ms_atender_km(void)
 {
     int32_t cod_op;
@@ -154,8 +149,7 @@ error_km:
     fd_km = -1;
 }
  
-/* =========================================================
- * ms_atender_cpu
+/* ms_atender_cpu
  * Hilo permanente por CPU conectada.
  * Protocolo CPU → MS:
  *   cod_op (int32_t)
@@ -163,7 +157,7 @@ error_km:
  *                   → responde: OP_OK | tamanio (int32_t) | datos
  *   OP_ESCRIBIR_MS: dir_fisica (int32_t) | tamanio (int32_t) | datos
  *                   → responde: OP_OK | OP_ERROR
- * ========================================================= */
+ */
  
 void *ms_atender_cpu(void *varg)
 {
@@ -280,10 +274,9 @@ desconectar:
     return NULL;
 }
  
-/* =========================================================
- * ms_iniciar_servidor_cpus
+/* ms_iniciar_servidor_cpus
  * Accept loop para CPUs. Bloqueante — se lanza en hilo.
- * ========================================================= */
+ */
  
 void ms_iniciar_servidor_cpus(int puerto)
 {
@@ -325,10 +318,9 @@ void *hilo_servidor_cpus(void *varg)
     return NULL;
 }
  
-/* =========================================================
- * main
+/* main
  * Uso: ./memory_stick memory_s.config <tamanio_en_bytes>
- * ========================================================= */
+ */
  
 int main(int argc, char *argv[])
 {
@@ -429,7 +421,6 @@ int main(int argc, char *argv[])
  
     /* ----- Arrancar servidor de CPUs en hilo propio ----- */
 
- 
     t_srv_arg *srv_arg = malloc(sizeof(t_srv_arg));
     srv_arg->puerto    = puerto_escucha;
  
@@ -457,3 +448,4 @@ int main(int argc, char *argv[])
     log_destroy(logger);
     return 0;
 }
+

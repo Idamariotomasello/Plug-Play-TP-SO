@@ -5,12 +5,11 @@
 
 #define SWAP_MAX_BLOQUES 4096
 
-/* =========================================================
- * Mapa de bloques
+/* Mapa de bloques
  * El módulo SWAP NO administra qué proceso tiene qué bloque;
  * eso es responsabilidad del Kernel Memory.
  * SWAP sólo expone: leer bloque N, escribir bloque N.
- * ========================================================= */
+ */
 
 extern t_log    *logger;
 extern t_config *config;

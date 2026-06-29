@@ -138,9 +138,9 @@ typedef struct
 	void* stream;
 } t_buffer;
 
-/* =========================================================
- * Registros de la CPU
- * ========================================================= */
+
+/* Registros de la CPU */
+
 typedef struct {
     uint32_t PC;   /* Program Counter — índice de instrucción */
     uint8_t  AX;

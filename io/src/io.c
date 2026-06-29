@@ -2,9 +2,7 @@
 #include <cliente.h>
 #include <server.h>
 
-/* =========================================================
- * Globales del módulo
- * ========================================================= */
+/* Globales del módulo */
  
 t_log    *logger = NULL;
 t_config *config = NULL;
@@ -12,13 +10,12 @@ t_config *config = NULL;
 op_code g_tipo_io  = IO_TIPO_INVALIDO;
 int       fd_ks      = -1;
  
-/* =========================================================
- * io_ejecutar_sleep
+/* io_ejecutar_sleep
  * Recibe tiempo_ms (int32_t) del KS, hace usleep, responde OK.
  * Protocolo KS → IO_SLEEP:
  *   OP_IO_SLEEP | PID (int32_t) | tiempo_ms (int32_t)
  * IO responde: OP_OK
- * ========================================================= */
+ */
  
 void io_ejecutar_sleep(int32_t pid)
 {
@@ -39,14 +36,13 @@ void io_ejecutar_sleep(int32_t pid)
     enviar_int32(fd_ks, OP_OK);
 }
  
-/* =========================================================
- * io_ejecutar_stdin
+/* io_ejecutar_stdin
  * Recibe cantidad_bytes (int32_t) del KS.
  * Lee por teclado, ajusta al tamaño, responde con los datos.
  * Protocolo KS → IO_STDIN:
  *   OP_IO_STDIN | PID (int32_t) | cantidad_bytes (int32_t)
  * IO responde: OP_OK | cantidad_bytes (int32_t) | datos
- * ========================================================= */
+ */
  
 void io_ejecutar_stdin(int32_t pid)
 {
@@ -91,13 +87,12 @@ void io_ejecutar_stdin(int32_t pid)
     free(buf);
 }
  
-/* =========================================================
- * io_ejecutar_stdout
+/* io_ejecutar_stdout
  * Recibe tamaño (int32_t) + datos del KS, imprime por pantalla.
  * Protocolo KS → IO_STDOUT:
  *   OP_IO_STDOUT | PID (int32_t) | tamanio (int32_t) | datos
  * IO responde: OP_OK
- * ========================================================= */
+ */
  
 void io_ejecutar_stdout(int32_t pid)
 {
@@ -133,10 +128,9 @@ void io_ejecutar_stdout(int32_t pid)
     enviar_int32(fd_ks, OP_OK);
 }
  
-/* =========================================================
- * io_loop
+/* io_loop
  * Loop principal: recibe cod_op del KS y despacha.
- * ========================================================= */
+ */
  
 void io_loop(void)
 {
@@ -178,9 +172,7 @@ void io_loop(void)
     log_warning(logger, "Kernel Scheduler desconectado — %s finalizando", nombre);
 }
  
-/* =========================================================
- * io_tipo_nombre / io_tipo_desde_string
- * ========================================================= */
+/* io_tipo_nombre / io_tipo_desde_string */
  
 const char *io_tipo_nombre(op_code tipo)
 {
@@ -201,10 +193,9 @@ op_code io_tipo_desde_string(const char *s)
     return IO_TIPO_INVALIDO;
 }
  
-/* =========================================================
- * main
+/* main
  * Uso: ./io io.config SLEEP|STDIN|STDOUT
- * ========================================================= */
+ */
  
 int main(int argc, char *argv[])
 {
@@ -283,4 +274,4 @@ int main(int argc, char *argv[])
     log_destroy(logger);
     return 0;
 }
- 
+

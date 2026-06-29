@@ -3,7 +3,6 @@
 
 #include <conexion.h>
 
-
  
 typedef enum {
     SYSCALL_NINGUNA = 0,
@@ -32,7 +31,6 @@ typedef struct {
     bool    activa;
     int32_t motivo;
 } t_interrupcion;
-
 
  
 /* Globales del módulo */
@@ -65,6 +63,4 @@ void *hilo_interrupciones(void *arg);
 void cpu_ciclo_instruccion(t_contexto *ctx);
 
  
-
-
 #endif

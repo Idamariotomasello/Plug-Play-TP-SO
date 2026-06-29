@@ -97,7 +97,6 @@ typedef struct {
 
 
 
-
 /* Prototipos — instrucciones y contexto */
 void  km_init_procesos(void);
 bool  km_cargar_instrucciones(int32_t pid, const char *path);
@@ -105,7 +104,6 @@ char *km_obtener_instruccion(int32_t pid, int32_t pc);
 int   km_contar_instrucciones(const char *path);
 void *km_leer_campo(void *stream, int stream_size, int *offset, int *campo_size);
 bool  km_recibir_cuerpo_paquete(int fd, void **stream_out, int *size_out);
-
 
 /* Prototipos — gestión de procesos (KS) */
 void km_procesar_crear_proceso(int fd_ks, void *stream, int stream_size);
