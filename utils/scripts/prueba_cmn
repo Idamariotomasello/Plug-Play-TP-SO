@@ -1,0 +1,6 @@
+MEM_ALLOC 0 32
+INIT_PROC cmn_proc_p2 2
+INIT_PROC cmn_proc_p2b 2
+INIT_PROC cmn_proc_p0b 0
+MEM_FREE 0
+EXIT

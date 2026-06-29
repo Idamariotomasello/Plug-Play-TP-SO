@@ -1,0 +1,4 @@
+MUTEX_LOCK mutex_inv
+SLEEP 2000
+MUTEX_UNLOCK mutex_inv
+EXIT

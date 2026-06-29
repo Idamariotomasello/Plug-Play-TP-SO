@@ -1,0 +1,3 @@
+MUTEX_LOCK mutex_inv
+MUTEX_UNLOCK mutex_inv
+EXIT

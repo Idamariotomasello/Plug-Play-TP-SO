@@ -1,0 +1,7 @@
+MEM_ALLOC 0 32
+MUTEX_CREATE mutex_inv
+INIT_PROC cmn_lock_low 2
+SLEEP 200
+INIT_PROC cmn_lock_high 0
+MEM_FREE 0
+EXIT
