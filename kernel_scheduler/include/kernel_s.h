@@ -39,6 +39,8 @@ t_mutex *ks_buscar_mutex(const char *nombre);
 void ks_registrar_io(int fd, int32_t subtipo);
 void ks_encolar_ready(t_pcb *pcb);
 bool ks_recibir_de_km(int32_t *out);
+void ks_pasar_a_exit(t_pcb *pcb);
+void ks_notificar_fin_proceso(t_pcb *pcb);
 bool ks_suspender_proceso(t_pcb *pcb);
 bool ks_dessuspender_proceso(t_pcb *pcb);
 t_pcb *cola_ready_desencolar(void);

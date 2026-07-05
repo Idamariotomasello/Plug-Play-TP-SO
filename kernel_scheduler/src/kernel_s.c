@@ -425,6 +425,49 @@ const char *ks_nombre_estado(e_estado_proceso e)
     }
 }
 
+/* ks_notificar_fin_proceso
+ * Avisa al Kernel Memory que el proceso terminó para que libere
+ * TODA su memoria (segmentos activos + bloques de swap si los tuviera).
+ * Debe llamarse SIN mutex_km_socket ni g_mutex_ks_pcbs tomados.
+ */
+void ks_notificar_fin_proceso(t_pcb *pcb)
+{
+    log_info(logger,
+             "## (%d) - Notificando finalización al KM — liberando memoria",
+             pcb->pid);
+
+    pthread_mutex_lock(&mutex_km_socket);
+    enviar_int32(fd_kernel_memory, OP_FINALIZAR_PROCESO);
+    enviar_int32(fd_kernel_memory, pcb->pid);
+
+    int32_t resp;
+    bool ok = ks_recibir_de_km(&resp) && resp == OP_OK;
+    pthread_mutex_unlock(&mutex_km_socket);
+
+    if (ok)
+        log_info(logger, "## (%d) - KM confirmó liberación de memoria", pcb->pid);
+    else
+        log_error(logger,
+                  "## (%d) - KM NO confirmó liberación de memoria (posible fuga)",
+                  pcb->pid);
+
+    /* Liberar el slot del PCB para que pueda reutilizarse */
+    pthread_mutex_lock(&g_mutex_ks_pcbs);
+    pcb->activo = false;
+    pthread_mutex_unlock(&g_mutex_ks_pcbs);
+}
+
+/* ks_pasar_a_exit
+ * Reemplaza TODAS las llamadas sueltas a ks_cambiar_estado(pcb, ESTADO_EXIT).
+ * Garantiza que ningún camino hacia EXIT olvide liberar memoria en el KM.
+ */
+void ks_pasar_a_exit(t_pcb *pcb)
+{
+    ks_cambiar_estado(pcb, ESTADO_EXIT);
+    ks_notificar_fin_proceso(pcb);
+}
+
+
 void ks_cambiar_estado(t_pcb *pcb, e_estado_proceso nuevo)
 {
     log_info(logger, "## (%d) Pasa del estado %s al estado %s",
@@ -637,7 +680,7 @@ void ks_io_request_completo(t_io_request *req, void *datos, int32_t datos_size)
             log_error(logger,
                       "## (%d) - STDIN: fallo escritura en memoria (SEG_FAULT)",
                       req->pid);
-            ks_cambiar_estado(pcb, ESTADO_EXIT);
+            ks_pasar_a_exit(pcb);
             return;
         }
         log_info(logger, "## (%d) - STDIN: datos escritos correctamente en memoria",
@@ -707,7 +750,7 @@ void ks_io_request_completo(t_io_request *req, void *datos, int32_t datos_size)
                 log_error(logger,
                         "## (%d) - Des-suspensión falló — proceso pasa a EXIT",
                         pcb->pid);
-                ks_cambiar_estado(pcb, ESTADO_EXIT);
+                ks_pasar_a_exit(pcb);
             }
         }
     } else {
@@ -925,7 +968,7 @@ void *ks_hilo_suspension(void *arg)
                             log_error(logger,
                                     "## (%d) - Des-suspensión tardía falló — proceso pasa a EXIT",
                                     pcb->pid);
-                            ks_cambiar_estado(pcb, ESTADO_EXIT);
+                            ks_pasar_a_exit(pcb);
                         }
                         // El mutex de pcbs ya fue soltado arriba antes del dessuspender,
                         // así que no hay que volver a tomarlo para el continue del loop.
@@ -1101,7 +1144,7 @@ void ks_procesar_syscall(t_pcb *pcb)
         t_io_request *req = ks_io_request_crear(pcb->pid, OP_IO_SLEEP, &ms, sizeof(ms), 0, 0);
         if (!req) {
             log_error(logger, "SLEEP: no se pudo crear request para PID %d", pcb->pid);
-            ks_cambiar_estado(pcb, ESTADO_EXIT);
+            ks_pasar_a_exit(pcb);
             return;
         }
 
@@ -1120,7 +1163,7 @@ void ks_procesar_syscall(t_pcb *pcb)
                                                 dir_logica, tamanio);
         if (!req) {
             log_error(logger, "STDIN: no se pudo crear request para PID %d", pcb->pid);
-            ks_cambiar_estado(pcb, ESTADO_EXIT);
+            ks_pasar_a_exit(pcb);
             return;
         }
 
@@ -1136,14 +1179,14 @@ void ks_procesar_syscall(t_pcb *pcb)
         void *buffer = malloc(tamanio);
         if (!buffer) {
             log_error(logger, "STDOUT: malloc falló para PID %d", pcb->pid);
-            ks_cambiar_estado(pcb, ESTADO_EXIT);
+            ks_pasar_a_exit(pcb);
             return;
         }
 
         if (!ks_leer_datos(pcb->pid, dir_logica, tamanio, buffer)) {
             log_error(logger, "STDOUT: fallo lectura de memoria para PID %d (SEG_FAULT)", pcb->pid);
             free(buffer);
-            ks_cambiar_estado(pcb, ESTADO_EXIT);
+            ks_pasar_a_exit(pcb);
             return;
         }
 
@@ -1164,7 +1207,7 @@ void ks_procesar_syscall(t_pcb *pcb)
 
         if (!req) {
             log_error(logger, "STDOUT: no se pudo crear request para PID %d", pcb->pid);
-            ks_cambiar_estado(pcb, ESTADO_EXIT);
+            ks_pasar_a_exit(pcb);
             return;
         }
 
@@ -1309,7 +1352,7 @@ void ks_procesar_syscall(t_pcb *pcb)
         }
 
     } else if (!strcmp(op, "EXIT")) {
-        ks_cambiar_estado(pcb, ESTADO_EXIT);
+        ks_pasar_a_exit(pcb);
         log_info(logger, "## (%d) finalizó su ejecución con motivo de EXIT", pcb->pid);
 
     } 
@@ -1324,7 +1367,7 @@ void ks_procesar_syscall(t_pcb *pcb)
         if (ks_crear_segmento(pcb->pid, seg_id, tamanio)) {
             ks_encolar_ready(pcb);
         } else {
-            ks_cambiar_estado(pcb, ESTADO_EXIT);
+            ks_pasar_a_exit(pcb);
         }
     
     } else if (!strcmp(op, "MUTEX_CREATE")) {
@@ -1424,6 +1467,37 @@ void *ks_hilo_quantum(void *varg)
     return NULL;
 }
 
+/* ks_obtener_o_crear_slot_cpu
+ * Busca el slot correspondiente a id_cpu. Si no existe todavía
+ * (porque esta es la primera de las dos conexiones que llega),
+ * lo crea como placeholder.
+ * Debe llamarse CON g_mutex_cpus tomado.
+ * Retorna el índice del slot, o -1 si no hay espacio.
+ */
+int ks_obtener_o_crear_slot_cpu(int32_t id_cpu)
+{
+    /* 1. ¿Ya existe un slot para este id_cpu? (llegó la otra conexión antes) */
+    for (int i = 0; i < MAX_CPUS; i++) {
+        if (g_cpus[i].id_cpu == id_cpu &&
+            (g_cpus[i].fd_dispatch != -1 || g_cpus[i].fd_interrupt != -1)) {
+            return i;
+        }
+    }
+
+    /* 2. No existe: crear un slot libre nuevo */
+    for (int i = 0; i < MAX_CPUS; i++) {
+        if (g_cpus[i].fd_dispatch == -1 && g_cpus[i].fd_interrupt == -1) {
+            g_cpus[i].id_cpu               = id_cpu;
+            g_cpus[i].pcb_actual            = NULL;
+            g_cpus[i].interrupcion_pendiente = false;
+            g_cpus[i].dispatch_id           = 0;
+            return i;
+        }
+    }
+
+    return -1; /* tabla llena */
+}
+
 void *atender_cliente_ks(void *varg)
 {
     t_hilo_arg *arg = (t_hilo_arg *)varg;
@@ -1445,31 +1519,35 @@ void *atender_cliente_ks(void *varg)
         pthread_mutex_lock(&g_mutex_cpus);
 
         if (canal == CANAL_CPU_INTERRUPT) {
-            /* Segunda conexión de esta CPU — registrar fd de interrupciones */
-            for (int i = 0; i < MAX_CPUS; i++) {
-                if (g_cpus[i].id_cpu == id_cpu) {
-                    g_cpus[i].fd_interrupt = fd;
-                    log_info(logger, "## CPU %d canal INTERRUPT registrado (fd=%d)", id_cpu, fd);
-                    break;
-                }
+            int slot = ks_obtener_o_crear_slot_cpu(id_cpu);
+            if (slot == -1) {
+                pthread_mutex_unlock(&g_mutex_cpus);
+                log_error(logger,
+                          "## CPU %d — sin espacio de slots para canal INTERRUPT (fd=%d)",
+                          id_cpu, fd);
+                close(fd);
+                return NULL;
             }
+            g_cpus[slot].fd_interrupt = fd;
+            log_info(logger, "## CPU %d canal INTERRUPT registrado (fd=%d, slot=%d)",
+                     id_cpu, fd, slot);
             pthread_mutex_unlock(&g_mutex_cpus);
             /* Este hilo no entra al loop planificador */
             return NULL;
         }
 
-        /* CANAL_CPU_DISPATCH — registrar slot principal */
-        for (int i = 0; i < MAX_CPUS; i++) {
-            if (g_cpus[i].fd_dispatch == -1) {
-                g_cpus[i].id_cpu       = id_cpu;
-                g_cpus[i].fd_dispatch  = fd;
-                g_cpus[i].fd_interrupt = -1;
-                g_cpus[i].pcb_actual = NULL;
-                g_cpus[i].interrupcion_pendiente = false;
-                g_cpus[i].dispatch_id = 0;
-                break;
-            }
+        /* CANAL_CPU_DISPATCH — registrar slot principal (reutiliza slot
+         * si el canal INTERRUPT ya había llegado y lo creó primero) */
+        int slot_dispatch = ks_obtener_o_crear_slot_cpu(id_cpu);
+        if (slot_dispatch == -1) {
+            pthread_mutex_unlock(&g_mutex_cpus);
+            log_error(logger,
+                      "## CPU %d — sin espacio de slots para canal DISPATCH (fd=%d)",
+                      id_cpu, fd);
+            close(fd);
+            return NULL;
         }
+        g_cpus[slot_dispatch].fd_dispatch = fd;
         pthread_mutex_unlock(&g_mutex_cpus);
 
         log_info(logger, "## CPU %d Conectada (fd=%d)", id_cpu, fd);
@@ -1492,18 +1570,24 @@ void *atender_cliente_ks(void *varg)
             int fd_irq_actual = -1;
             uint64_t dispatch_id_actual = 0;
             pthread_mutex_lock(&g_mutex_cpus);
-            for (int i = 0; i < MAX_CPUS; i++) {
-                if (g_cpus[i].fd_dispatch == fd) {
-                    g_cpus[i].pcb_actual = pcb;
-                    g_cpus[i].interrupcion_pendiente = false;
-                    g_cpus[i].dispatch_id++;
-                    dispatch_id_actual = g_cpus[i].dispatch_id;
-                    fd_irq_actual = g_cpus[i].fd_interrupt;
-                    pcb->fd_cpu_asignada = fd;
-                    break;
+        for (int i = 0; i < MAX_CPUS; i++) {
+            if (g_cpus[i].fd_dispatch == fd) {
+                if (g_cpus[i].fd_interrupt != -1) {
+                    close(g_cpus[i].fd_interrupt);
+                    log_info(logger,
+                             "## CPU %d — cerrando también canal INTERRUPT (fd=%d) al desconectar",
+                             id_cpu, g_cpus[i].fd_interrupt);
                 }
+                g_cpus[i].fd_dispatch  = -1;
+                g_cpus[i].fd_interrupt = -1;
+                g_cpus[i].id_cpu       = -1;
+                g_cpus[i].pcb_actual = NULL;
+                g_cpus[i].interrupcion_pendiente = false;
+                g_cpus[i].dispatch_id = 0;
+                break;
             }
-            pthread_mutex_unlock(&g_mutex_cpus);
+        }
+        pthread_mutex_unlock(&g_mutex_cpus);
             log_info(logger, "## CPU %d — enviando PID %d a ejecutar", id_cpu, pcb->pid);
 
             /* Enviar PID a la CPU */
@@ -1603,7 +1687,7 @@ void *atender_cliente_ks(void *varg)
 
             switch (motivo) {
                 case KS_MOTIVO_EXIT:
-                    ks_cambiar_estado(pcb, ESTADO_EXIT);
+                    ks_pasar_a_exit(pcb);
                     log_info(logger, "## (%d) finalizó su ejecución con motivo de EXIT",
                              pid_ret);
                     break;
@@ -1619,7 +1703,7 @@ void *atender_cliente_ks(void *varg)
                     break;
 
                 case KS_MOTIVO_SEG_FAULT:
-                    ks_cambiar_estado(pcb, ESTADO_EXIT);
+                    ks_pasar_a_exit(pcb);
                     log_info(logger, "## (%d) finalizó su ejecución con motivo de SEG_FAULT",
                              pid_ret);
                     break;
@@ -1751,14 +1835,14 @@ void cola_ready_encolar_cmn(t_pcb *pcb)
         log_error(logger,
                   "## (%d) - CMN: prioridad %d fuera de rango [0,%d], no se encola",
                   pcb->pid, pcb->prioridad, g_cmn_cantidad_colas - 1);
-        ks_cambiar_estado(pcb, ESTADO_EXIT);
+        ks_pasar_a_exit(pcb);
         return;
     }
 
     t_nodo_ready *nuevo_cmn = malloc(sizeof(t_nodo_ready));
     if (!nuevo_cmn) {
         log_error(logger, "CMN: malloc fallo al encolar PID %d", pcb->pid);
-        ks_cambiar_estado(pcb, ESTADO_EXIT);
+        ks_pasar_a_exit(pcb);
         return;
     }
     nuevo_cmn->pcb = pcb;
@@ -1871,7 +1955,7 @@ void ks_encolar_ready(t_pcb *pcb)
                 log_error(logger,
                           "## (%d) - CMN: prioridad %d fuera de rango [0,%d], proceso a EXIT",
                           pcb->pid, pcb->prioridad, g_cmn_cantidad_colas - 1);
-                ks_cambiar_estado(pcb, ESTADO_EXIT);
+                ks_pasar_a_exit(pcb);
                 return;
             }
 
