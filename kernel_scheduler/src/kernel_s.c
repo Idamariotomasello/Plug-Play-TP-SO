@@ -1570,24 +1570,19 @@ void *atender_cliente_ks(void *varg)
             int fd_irq_actual = -1;
             uint64_t dispatch_id_actual = 0;
             pthread_mutex_lock(&g_mutex_cpus);
-        for (int i = 0; i < MAX_CPUS; i++) {
-            if (g_cpus[i].fd_dispatch == fd) {
-                if (g_cpus[i].fd_interrupt != -1) {
-                    close(g_cpus[i].fd_interrupt);
-                    log_info(logger,
-                             "## CPU %d — cerrando también canal INTERRUPT (fd=%d) al desconectar",
-                             id_cpu, g_cpus[i].fd_interrupt);
+            for (int i = 0; i < MAX_CPUS; i++) {
+                if (g_cpus[i].fd_dispatch == fd) {
+                    g_cpus[i].pcb_actual = pcb;
+                    g_cpus[i].interrupcion_pendiente = false;
+                    g_cpus[i].dispatch_id++;
+                    dispatch_id_actual = g_cpus[i].dispatch_id;
+                    fd_irq_actual = g_cpus[i].fd_interrupt;
+                    pcb->fd_cpu_asignada = fd;
+                    break;
                 }
-                g_cpus[i].fd_dispatch  = -1;
-                g_cpus[i].fd_interrupt = -1;
-                g_cpus[i].id_cpu       = -1;
-                g_cpus[i].pcb_actual = NULL;
-                g_cpus[i].interrupcion_pendiente = false;
-                g_cpus[i].dispatch_id = 0;
-                break;
             }
-        }
-        pthread_mutex_unlock(&g_mutex_cpus);
+            pthread_mutex_unlock(&g_mutex_cpus);
+
             log_info(logger, "## CPU %d — enviando PID %d a ejecutar", id_cpu, pcb->pid);
 
             /* Enviar PID a la CPU */
