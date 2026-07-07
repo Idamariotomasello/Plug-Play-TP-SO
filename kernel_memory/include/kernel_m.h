@@ -13,6 +13,7 @@
 
 #define TROZO_HAS_EN_SWAP 1
 
+
 /* Globales */
 
 extern bool          g_procesos_init;
@@ -122,7 +123,7 @@ t_hueco *km_buscar_hueco(int32_t tamanio);
 void     km_liberar_trozo(const t_trozo_segmento *trozo);
 void     km_hueco_agregar(const t_hueco *h);
 void     km_mergear_huecos(int32_t ms_id);
-void     km_compactar(void);
+bool km_traducir_global_a_ms(int32_t dir_global, int32_t *ms_id_out, int32_t *offset_out);
  
 /* Prototipos — SWAP */
 int32_t km_swap_reservar_bloque(void);

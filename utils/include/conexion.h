@@ -30,6 +30,7 @@ void saludar(char* quien);
 #define MAX_MS          16   /* máximo de Memory Sticks simultáneos */
 #define KS_MAX_MUTEX 32
 #define MAX_BLOQUES_SWAP_POR_TROZO 1024
+#define MAX_TROZOS_POR_SEGMENTO 8
 
 extern t_log *logger;
 extern t_config *config;
