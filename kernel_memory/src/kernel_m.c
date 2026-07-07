@@ -447,6 +447,69 @@ void km_liberar_trozo(const t_trozo_segmento *trozo)
 
 /* SECCIÓN 4 — COMPACTACIÓN */
 
+typedef struct {
+    int32_t pid;
+    int32_t seg_id;
+    int32_t total_sub_trozos;
+} t_contador_seg;
+
+/* km_obtener_o_crear_contador
+ * Busca en el arreglo 'contadores' la entrada correspondiente a (pid, seg_id).
+ * Si no existe, la crea con total_sub_trozos = 0 y actualiza *n_contadores.
+ * Devuelve un puntero al campo total_sub_trozos para que el caller lo
+ * incremente directamente.
+ *
+ * NO requiere mutex: se usa exclusivamente dentro de la Fase 2 de
+ * km_compactar_global, que corre sin locks generales pero de forma
+ * secuencial (un solo hilo).
+ */
+int32_t *km_obtener_o_crear_contador(t_contador_seg *contadores, int *n_contadores,
+                                      int32_t pid, int32_t seg_id)
+{
+    for (int i = 0; i < *n_contadores; i++) {
+        if (contadores[i].pid == pid && contadores[i].seg_id == seg_id)
+            return &contadores[i].total_sub_trozos;
+    }
+
+    /* No existe: crear nueva entrada */
+    contadores[*n_contadores].pid              = pid;
+    contadores[*n_contadores].seg_id           = seg_id;
+    contadores[*n_contadores].total_sub_trozos = 0;
+    int32_t *ptr = &contadores[*n_contadores].total_sub_trozos;
+    (*n_contadores)++;
+    return ptr;
+}
+
+/* km_reemplazar_todos_los_trozos_de_segmento
+ * Reemplaza DE UNA SOLA VEZ el array completo de trozos de un segmento,
+ * evitando cualquier identificación por puntero/índice que pueda quedar
+ * invalidada por reemplazos previos del mismo array.
+ */
+void km_reemplazar_todos_los_trozos_de_segmento(int32_t pid, int32_t seg_id,
+                                                 t_trozo_segmento *nuevos_totales,
+                                                 int32_t n_totales)
+{
+    if (n_totales > MAX_TROZOS_POR_SEGMENTO) {
+        log_error(g_logger,
+            "COMPACT: PID %d seg %d - %d trozos excede MAX_TROZOS_POR_SEGMENTO (%d)",
+            pid, seg_id, n_totales, MAX_TROZOS_POR_SEGMENTO);
+        return;
+    }
+    for (int i = 0; i < KM_MAX_PROCESOS; i++) {
+        if (!g_procesos[i].activo || g_procesos[i].pid != pid) continue;
+        for (int s = 0; s < g_procesos[i].n_segmentos; s++) {
+            t_segmento *seg = &g_procesos[i].segmentos[s];
+            if (!seg->activo || seg->seg_id != seg_id) continue;
+
+            memcpy(seg->trozos, nuevos_totales, n_totales * sizeof(t_trozo_segmento));
+            seg->n_trozos = n_totales;
+            return;
+        }
+    }
+    log_error(g_logger, "COMPACT: no se encontró PID %d seg %d para commit final", pid, seg_id);
+}
+
+
 /* km_compactar_global
  * Compacta toda la memoria moviendo todos los trozos (de todos los procesos)
  * al principio de la memoria global (base 0), distribuyéndolos a lo largo de
@@ -465,12 +528,14 @@ void km_compactar_global(void)
     pthread_mutex_lock(&mutex_ms_lista);
     pthread_mutex_lock(&mutex_procesos);
 
-    // 1. Recolectar todos los trozos en memoria (no swap) de todos los procesos
+    // Fase 1: snapshot - Recolectar todos los trozos en memoria (no swap) de todos los procesos
     typedef struct {
         t_trozo_segmento *trozo;
         int32_t           tam;
+        int32_t           pid;
+        int32_t           seg_id;
     } t_trozo_ref;
-    t_trozo_ref trozos[MAX_HUECOS]; // máximo razonable
+    t_trozo_ref trozos[MAX_HUECOS];
     int n_trozos = 0;
 
     for (int p = 0; p < KM_MAX_PROCESOS; p++) {
@@ -485,110 +550,257 @@ void km_compactar_global(void)
 #endif
                 trozos[n_trozos].trozo = trozo;
                 trozos[n_trozos].tam   = trozo->tamanio;
+                trozos[n_trozos].pid    = g_procesos[p].pid;
+                trozos[n_trozos].seg_id = seg->seg_id;
                 n_trozos++;
             }
         }
     }
 
-    // 2. Compactar en orden: cursor_global = 0
+    pthread_mutex_unlock(&mutex_procesos);
+    pthread_mutex_unlock(&mutex_ms_lista);
+    pthread_mutex_unlock(&mutex_huecos);
+
+    /* Fase 2: migración — 
+       Los resultados se acumulan en un buffer local, NO se tocan
+       g_procesos ni g_huecos todavía. */
     int32_t cursor_global = 0;
+    bool compactacion_ok = true;
+
+    /* estructura auxiliar para diferir el commit */
+    typedef struct {
+        int32_t pid, seg_id;
+        t_trozo_segmento *viejo;
+        t_trozo_segmento nuevos[MAX_TROZOS_POR_SEGMENTO];
+        int32_t n_nuevos;
+    } t_commit_pendiente;
+    t_commit_pendiente commits[MAX_HUECOS];
+    int n_commits = 0;
+    
+    t_contador_seg contadores[MAX_HUECOS];
+    int n_contadores = 0;
 
     for (int i = 0; i < n_trozos; i++) {
-        t_trozo_segmento *trozo = trozos[i].trozo;
-        int32_t tam = trozo->tamanio;
+        t_trozo_segmento *trozo_orig = trozos[i].trozo;
+        int32_t tam_total   = trozo_orig->tamanio;
+        int32_t fd_origen   = g_ms_lista[trozo_orig->ms_id].fd;
+        int32_t dir_origen  = trozo_orig->dir_fisica_ms;
 
-        // Determinar en qué MS y offset debe ir el trozo según cursor_global
-        int32_t ms_destino = -1;
-        int32_t offset_destino = 0;
+        /* Leemos TODO el contenido del trozo origen de una vez (sigue en 1 sola MS,
+        porque un trozo YA existente nunca cruza MS: eso es justamente lo que
+        vamos a permitir de acá en más, pero recién tras esta migración) */
+        void *buf = malloc(tam_total);
+        pthread_mutex_lock(&mutex_ms_ops[trozo_orig->ms_id]);
+        enviar_int32(fd_origen, OP_LEER_MS);
+        enviar_int32(fd_origen, dir_origen);
+        enviar_int32(fd_origen, tam_total);
+        int32_t resp, tam_r;
+        bool ok_leer = recibir_int32(fd_origen, &resp) && resp == OP_OK
+                    && recibir_int32(fd_origen, &tam_r)
+                    && recv(fd_origen, buf, tam_r, MSG_WAITALL) == tam_r;
+        pthread_mutex_unlock(&mutex_ms_ops[trozo_orig->ms_id]);
+
+        if (!ok_leer) {
+            log_error(g_logger, "COMPACT: fallo leyendo trozo origen MS=%d dir=%d tam=%d",
+                    trozo_orig->ms_id, dir_origen, tam_total);
+            free(buf);
+            compactacion_ok = false;
+            goto reintentar_locks;
+        }
+
+        /* Ahora escribimos buf[0..tam_total) empezando en cursor_global,
+        partiendo en tantos sub-tramos como MS distintas toque */
+        t_trozo_segmento nuevos_trozos[MAX_TROZOS_POR_SEGMENTO];
+        int32_t n_nuevos = 0;
+        int32_t escrito = 0;
+
+        while (escrito < tam_total) {
+            int32_t ms_destino, offset_destino;
+            if (!km_traducir_global_a_ms(cursor_global, &ms_destino, &offset_destino)) {
+                log_error(g_logger, "COMPACT: cursor_global fuera de rango (%d)", cursor_global);
+                free(buf);
+                compactacion_ok = false;
+                goto reintentar_locks;
+            }
+
+            int32_t espacio_en_ms = g_ms_lista[ms_destino].tamanio - offset_destino;
+            int32_t a_escribir = tam_total - escrito;
+            if (a_escribir > espacio_en_ms)
+                a_escribir = espacio_en_ms;
+
+            /* ── Chequeo ACUMULADO por segmento (cubre múltiples trozos originales del mismo segmento, no solo este trozo) ── */
+            int32_t *total_seg = km_obtener_o_crear_contador(contadores, &n_contadores, trozos[i].pid, trozos[i].seg_id);
+            if (*total_seg + 1 > MAX_TROZOS_POR_SEGMENTO) {
+                log_error(g_logger,
+                    "COMPACT: PID %d seg %d - supera MAX_TROZOS_POR_SEGMENTO (%d) al "
+                    "consolidar múltiples trozos originales — abortando compactación completa",
+                    trozos[i].pid, trozos[i].seg_id, MAX_TROZOS_POR_SEGMENTO);
+                free(buf);
+                compactacion_ok = false;
+                goto reintentar_locks;
+            }
+
+            /* ── Bound-check antes de escribir en nuevos_trozos[] ── */
+            if (n_nuevos >= MAX_TROZOS_POR_SEGMENTO) {
+                log_error(g_logger,
+                    "COMPACT: PID %d seg %d - el trozo se fragmenta en más de "
+                    "MAX_TROZOS_POR_SEGMENTO (%d) partes al cruzar MS — abortando compactación",
+                    trozos[i].pid, trozos[i].seg_id, MAX_TROZOS_POR_SEGMENTO);
+                free(buf);
+                compactacion_ok = false;
+                goto reintentar_locks;
+            }
+
+            int fd_destino = g_ms_lista[ms_destino].fd;
+            pthread_mutex_lock(&mutex_ms_ops[ms_destino]);
+            enviar_int32(fd_destino, OP_ESCRIBIR_MS);
+            enviar_int32(fd_destino, offset_destino);
+            enviar_int32(fd_destino, a_escribir);
+            send(fd_destino, (char*)buf + escrito, a_escribir, MSG_NOSIGNAL);
+            int32_t resp_w;
+            bool ok_w = recibir_int32(fd_destino, &resp_w) && resp_w == OP_OK;
+            pthread_mutex_unlock(&mutex_ms_ops[ms_destino]);
+
+            if (!ok_w) {
+                log_error(g_logger,
+                    "COMPACT: fallo escribiendo en MS=%d offset=%d tam=%d — abortando compactación",
+                    ms_destino, offset_destino, a_escribir);
+                free(buf);
+                compactacion_ok = false;
+                goto reintentar_locks;
+            }
+
+            log_info(g_logger,
+                "COMPACT: trozo movido MS=%d dir_fisica=%d tam=%d (global=%d)",
+                ms_destino, offset_destino, a_escribir, cursor_global);
+
+            /* Registrar el sub-trozo resultante */
+            nuevos_trozos[n_nuevos].ms_id         = ms_destino;
+            nuevos_trozos[n_nuevos].dir_fisica_ms = offset_destino;
+            nuevos_trozos[n_nuevos].offset_seg    = trozo_orig->offset_seg + escrito;
+            nuevos_trozos[n_nuevos].tamanio       = a_escribir;
+            nuevos_trozos[n_nuevos].en_swap       = false;
+            n_nuevos++;
+
+            /* ── Incrementar el contador acumulado recién ahora que el sub-trozo fue efectivamente confirmado ── */
+            (*total_seg)++;
+
+            escrito       += a_escribir;
+            cursor_global += a_escribir;
+        }
+        free(buf);
+
+        /* guardar el resultado para aplicarlo en la Fase 3 */
+        commits[n_commits].pid    = trozos[i].pid;
+        commits[n_commits].seg_id = trozos[i].seg_id;
+        commits[n_commits].viejo  = trozo_orig;
+        commits[n_commits].n_nuevos = n_nuevos;
+        memcpy(commits[n_commits].nuevos, nuevos_trozos,
+               n_nuevos * sizeof(t_trozo_segmento));
+        n_commits++;
+    }
+
+reintentar_locks:
+    pthread_mutex_lock(&mutex_huecos);
+    pthread_mutex_lock(&mutex_ms_lista);
+    pthread_mutex_lock(&mutex_procesos);
+
+    /* Fase 3: commit — re-tomar locks solo para aplicar cambios en memoria */
+
+    if (compactacion_ok) {
+    /* Agrupar commits por (pid, seg_id), preservando el orden en que fueron encontrados en la Fase 1/2 (que respeta el orden original de offset_seg dentro del segmento) */
+        bool procesado[MAX_HUECOS] = {false};
+
+        for (int c = 0; c < n_commits; c++) {
+            if (procesado[c]) continue;
+
+            int32_t pid    = commits[c].pid;
+            int32_t seg_id = commits[c].seg_id;
+
+            t_trozo_segmento acumulado[MAX_TROZOS_POR_SEGMENTO];
+            int32_t n_acumulado = 0;
+            bool overflow = false;
+
+            /* Recorrer TODOS los commits restantes de este mismo segmento */
+            for (int c2 = c; c2 < n_commits; c2++) {
+                if (procesado[c2]) continue;
+                if (commits[c2].pid != pid || commits[c2].seg_id != seg_id) continue;
+
+                if (n_acumulado + commits[c2].n_nuevos > MAX_TROZOS_POR_SEGMENTO) {
+                    log_error(g_logger,
+                        "COMPACT: PID %d seg %d - excede MAX_TROZOS_POR_SEGMENTO al consolidar commits",
+                        pid, seg_id);
+                    overflow = true;
+                    break;
+                }
+                memcpy(&acumulado[n_acumulado], commits[c2].nuevos,
+                    commits[c2].n_nuevos * sizeof(t_trozo_segmento));
+                n_acumulado += commits[c2].n_nuevos;
+                procesado[c2] = true;
+            }
+
+            if (!overflow)
+                km_reemplazar_todos_los_trozos_de_segmento(pid, seg_id, acumulado, n_acumulado);
+        }
+
+        // Fase 4: Reconstruir la lista de huecos
+        /* cursor_global, al llegar acá, representa el total de bytes realmente escritos con éxito. Si hubo abort, ya hicimos goto unlock antes. */
+        g_huecos_count = 0;
         int32_t acumulado = 0;
         for (int m = 0; m < g_ms_count; m++) {
             if (!g_ms_lista[m].activo) continue;
-            if (cursor_global < acumulado + g_ms_lista[m].tamanio) {
-                ms_destino = m;
-                offset_destino = cursor_global - acumulado;
-                break;
+            int32_t inicio_ms = acumulado;
+            int32_t fin_ms     = acumulado + g_ms_lista[m].tamanio;
+
+            int32_t ocupado_en_ms = 0;
+            if (cursor_global > inicio_ms)
+                ocupado_en_ms = (cursor_global < fin_ms) ? (cursor_global - inicio_ms) : g_ms_lista[m].tamanio;
+
+            int32_t libre = g_ms_lista[m].tamanio - ocupado_en_ms;
+            if (libre > 0) {
+                t_hueco h = { .activo = true, .ms_id = m,
+                            .base = ocupado_en_ms, .tamanio = libre };
+                g_huecos[g_huecos_count++] = h;
+                log_info(g_logger, "COMPACT: MS=%d hueco [%d,%d) = %d bytes",
+                        m, ocupado_en_ms, ocupado_en_ms + libre, libre);
             }
-            acumulado += g_ms_lista[m].tamanio;
-        }
-        if (ms_destino == -1) {
-            log_error(g_logger, "Compactación: cursor_global fuera de rango");
-            goto unlock;
+            acumulado = fin_ms;
         }
 
-        // Si el trozo ya está en esa posición exacta, solo avanzar cursor
-        if (trozo->ms_id == ms_destino && trozo->dir_fisica_ms == offset_destino) {
-            cursor_global += tam;
-            continue;
+        /* ── Assert de consistencia ── */
+        int32_t total_ocupado = 0;
+        for (int p = 0; p < KM_MAX_PROCESOS; p++) {
+            if (!g_procesos[p].activo) continue;
+            for (int s = 0; s < g_procesos[p].n_segmentos; s++) {
+                if (!g_procesos[p].segmentos[s].activo) continue;
+                for (int t = 0; t < g_procesos[p].segmentos[s].n_trozos; t++) {
+                    t_trozo_segmento *tr = &g_procesos[p].segmentos[s].trozos[t];
+                    if (!tr->en_swap)
+                        total_ocupado += tr->tamanio;
+                }
+            }
         }
+        int32_t total_libre = 0;
+        for (int h = 0; h < g_huecos_count; h++)
+            if (g_huecos[h].activo) total_libre += g_huecos[h].tamanio;
 
-        // Leer del origen
-        int fd_origen = g_ms_lista[trozo->ms_id].fd;
-        void *buf = malloc(tam);
-        if (!buf) {
-            log_error(g_logger, "Compactación: malloc falló");
-            goto unlock;
+        if (total_ocupado + total_libre != g_memoria_total) {
+            log_error(g_logger,
+                "## INCONSISTENCIA POST-COMPACT: ocupado=%d + libre=%d != memoria_total=%d",
+                total_ocupado, total_libre, g_memoria_total);
         }
-
-        pthread_mutex_lock(&mutex_ms_ops[trozo->ms_id]);
-        enviar_int32(fd_origen, OP_LEER_MS);
-        enviar_int32(fd_origen, trozo->dir_fisica_ms);
-        enviar_int32(fd_origen, tam);
-        int32_t resp, tam_r;
-        recibir_int32(fd_origen, &resp);
-        recibir_int32(fd_origen, &tam_r);
-        recv(fd_origen, buf, tam_r, MSG_WAITALL);
-        pthread_mutex_unlock(&mutex_ms_ops[trozo->ms_id]);
-
-        // Escribir en el destino
-        int fd_destino = g_ms_lista[ms_destino].fd;
-        pthread_mutex_lock(&mutex_ms_ops[ms_destino]);
-        enviar_int32(fd_destino, OP_ESCRIBIR_MS);
-        enviar_int32(fd_destino, offset_destino);
-        enviar_int32(fd_destino, tam);
-        send(fd_destino, buf, tam, MSG_NOSIGNAL);
-        recibir_int32(fd_destino, &resp);
-        pthread_mutex_unlock(&mutex_ms_ops[ms_destino]);
-
-        free(buf);
-
-        // Actualizar el trozo
-        trozo->ms_id = ms_destino;
-        trozo->dir_fisica_ms = offset_destino;
-
-        cursor_global += tam;
-    }
-
-    // 3. Reconstruir la lista de huecos
-    g_huecos_count = 0;
-    int32_t acum = 0;
-    for (int m = 0; m < g_ms_count; m++) {
-        if (!g_ms_lista[m].activo) continue;
-        int32_t ocupado = 0;
-        if (cursor_global > acum) {
-            ocupado = (cursor_global - acum < g_ms_lista[m].tamanio) ?
-                      (cursor_global - acum) : g_ms_lista[m].tamanio;
-        }
-        int32_t libre = g_ms_lista[m].tamanio - ocupado;
-        if (libre > 0) {
-            t_hueco h = {
-                .activo = true,
-                .ms_id = m,
-                .base = ocupado,
-                .tamanio = libre
-            };
-            g_huecos[g_huecos_count++] = h;
-            log_info(g_logger,
-                     "COMPACT: MS=%d hueco [%d, %d) = %d bytes",
-                     m, ocupado, ocupado + libre, libre);
-        }
-        acum += g_ms_lista[m].tamanio;
-        if (cursor_global <= acum) break; // ya no hay más datos
+    } else {
+        log_error(g_logger, "## Compactación abortada por fallo de I/O — memoria puede quedar en estado transitorio");
     }
 
 unlock:
     pthread_mutex_unlock(&mutex_procesos);
     pthread_mutex_unlock(&mutex_ms_lista);
     pthread_mutex_unlock(&mutex_huecos);
+
+    int compact_delay = config_get_int_value(g_config, "COMPACTION_DELAY");
+    if (compact_delay > 0)
+        usleep(compact_delay * 1000);
 
     log_info(g_logger, "## Fin de compactación");
 }
@@ -1125,6 +1337,27 @@ void km_escribir_datos(int fd_ks, int32_t pid, int32_t dir_logica,
     enviar_int32(fd_ks, resp);
 }
 
+/* Traduce una dirección física GLOBAL (0..g_memoria_total-1) a (ms_id, offset local) */
+bool km_traducir_global_a_ms(int32_t dir_global, int32_t *ms_id_out, int32_t *offset_out)
+{
+    int32_t acumulado = 0;
+    for (int m = 0; m < g_ms_count; m++) {
+        if (!g_ms_lista[m].activo) continue;
+        if (dir_global >= acumulado && dir_global < acumulado + g_ms_lista[m].tamanio) {
+            *ms_id_out = m;
+            *offset_out = dir_global - acumulado;
+            return true;
+        }
+        acumulado += g_ms_lista[m].tamanio;
+    }
+    return false;
+}
+
+/* Inversa: dado (ms_id, offset local) devuelve la dirección física global */
+int32_t km_ms_a_global(int32_t ms_id, int32_t offset_local)
+{
+    return g_ms_lista[ms_id].base_global + offset_local;
+}
 
 /* SECCIÓN 9 — km_atender_ms ACTUALIZADO
 (reemplaza la anterior versión para que inicialice huecos correctamente)
