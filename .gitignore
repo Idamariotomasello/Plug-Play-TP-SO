@@ -4,6 +4,9 @@
 # CLion files
 .idea/
 
+# Visual Studio Code
+.vscode/
+
 # Log files
 *.log
 
