@@ -446,125 +446,150 @@ void km_liberar_trozo(const t_trozo_segmento *trozo)
 
 
 /* SECCIÓN 4 — COMPACTACIÓN */
- 
-/* km_compactar
- * Reordena todos los segmentos activos al principio de cada MS,
- * eliminando la fragmentación interna.
+
+/* km_compactar_global
+ * Compacta toda la memoria moviendo todos los trozos (de todos los procesos)
+ * al principio de la memoria global (base 0), distribuyéndolos a lo largo de
+ * de los Memory Sticks en orden. Después de esta operación:
+ *   - Todos los trozos quedan contiguos desde la dirección global 0.
+ *   - Cada MS queda ocupado desde su offset 0 hasta donde alcance.
+ *   - La lista de huecos se reconstruye con un único hueco al final de cada MS.
  *
- * Precondición: todas las CPUs ya fueron desalojadas (el KS lo garantiza).
- * Postcondición: tablas de segmentos de todos los procesos actualizadas,
- *                lista de huecos reconstruida con un único hueco al final
- *                de cada MS.
- *
- * Implementación simplificada (un solo MS a la vez, en orden):
- *   Para cada MS:
- *     1. Recolectar todos los trozos que viven en ese MS.
- *     2. Copiar datos al inicio del MS (offset 0 en adelante).
- *     3. Actualizar dir_fisica_ms en cada trozo.
- *     4. Reconstruir un único hueco al final.
+ * Precondición: todas las CPUs han sido desalojadas (garantizado por el KS).
  */
-void km_compactar(void)
+void km_compactar_global(void)
 {
     log_info(g_logger, "## Inicio de compactación");
- 
+
     pthread_mutex_lock(&mutex_huecos);
     pthread_mutex_lock(&mutex_ms_lista);
     pthread_mutex_lock(&mutex_procesos);
- 
-    for (int ms = 0; ms < g_ms_count; ms++) {
-        if (!g_ms_lista[ms].activo) continue;
- 
-        int32_t cursor = 0;   /* siguiente dirección física libre en este MS */
 
-        /* Recorrer todos los procesos y sus trozos en este MS */
-        for (int p = 0; p < KM_MAX_PROCESOS; p++) {
-            if (!g_procesos[p].activo) continue;
- 
-            for (int s = 0; s < g_procesos[p].n_segmentos; s++) {
-                t_segmento *seg = &g_procesos[p].segmentos[s];
-                if (!seg->activo) continue;
+    // 1. Recolectar todos los trozos en memoria (no swap) de todos los procesos
+    typedef struct {
+        t_trozo_segmento *trozo;
+        int32_t           tam;
+    } t_trozo_ref;
+    t_trozo_ref trozos[MAX_HUECOS]; // máximo razonable
+    int n_trozos = 0;
 
- 
-                for (int t = 0; t < seg->n_trozos; t++) {
-                    t_trozo_segmento *trozo = &seg->trozos[t];
+    for (int p = 0; p < KM_MAX_PROCESOS; p++) {
+        if (!g_procesos[p].activo) continue;
+        for (int s = 0; s < g_procesos[p].n_segmentos; s++) {
+            t_segmento *seg = &g_procesos[p].segmentos[s];
+            if (!seg->activo) continue;
+            for (int t = 0; t < seg->n_trozos; t++) {
+                t_trozo_segmento *trozo = &seg->trozos[t];
 #ifdef TROZO_HAS_EN_SWAP
-                    if (trozo->en_swap) continue;
+                if (trozo->en_swap) continue;
 #endif
-                    if (trozo->ms_id != ms) continue;
- 
-                    int32_t src = trozo->dir_fisica_ms;
-                    int32_t dst = cursor;
-
-                    if (src != dst) {
-                        /* Mover datos dentro del MS usando los sockets */
-                        void *buf = malloc(trozo->tamanio);
-                        if (buf) {
-                            int fd = g_ms_lista[ms].fd;
- 
-                            pthread_mutex_lock(&mutex_ms_ops[ms]);
-
-                            /* Leer desde src */
-                            enviar_int32(fd, 700 /* OP_LEER_MS */);
-                            enviar_int32(fd, src);
-                            enviar_int32(fd, trozo->tamanio);
-                            int32_t resp, tam_r;
-                            recibir_int32(fd, &resp);
-                            recibir_int32(fd, &tam_r);
-                            recv(fd, buf, tam_r, MSG_WAITALL);
- 
-                            pthread_mutex_unlock(&mutex_ms_ops[ms]);
-
-                            trozo->dir_fisica_ms = dst;
-
-                            pthread_mutex_lock(&mutex_ms_ops[ms]);
-
-                            /* Escribir en dst */
-                            enviar_int32(fd, 701 /* OP_ESCRIBIR_MS */);
-                            enviar_int32(fd, dst);
-                            enviar_int32(fd, trozo->tamanio);
-                            send(fd, buf, trozo->tamanio, MSG_NOSIGNAL);
-                            recibir_int32(fd, &resp);
-
-                            pthread_mutex_unlock(&mutex_ms_ops[ms]);
- 
-                            free(buf);
-                        }
-                        /* Actualizar dirección física en el trozo */
-                        trozo->dir_fisica_ms = dst;
- 
-                    }
-                    cursor += trozo->tamanio;
-                }
+                trozos[n_trozos].trozo = trozo;
+                trozos[n_trozos].tam   = trozo->tamanio;
+                n_trozos++;
             }
         }
- 
-        /* Reconstruir huecos de este MS: un único hueco al final */
-        /* Eliminar huecos viejos del MS */
-        int nc = 0;
-        for (int i = 0; i < g_huecos_count; i++)
-            if (g_huecos[i].activo && g_huecos[i].ms_id != ms)
-                g_huecos[nc++] = g_huecos[i];
-        g_huecos_count = nc;
- 
-        int32_t espacio_libre = g_ms_lista[ms].tamanio - cursor;
-        if (espacio_libre > 0) {
+    }
+
+    // 2. Compactar en orden: cursor_global = 0
+    int32_t cursor_global = 0;
+
+    for (int i = 0; i < n_trozos; i++) {
+        t_trozo_segmento *trozo = trozos[i].trozo;
+        int32_t tam = trozo->tamanio;
+
+        // Determinar en qué MS y offset debe ir el trozo según cursor_global
+        int32_t ms_destino = -1;
+        int32_t offset_destino = 0;
+        int32_t acumulado = 0;
+        for (int m = 0; m < g_ms_count; m++) {
+            if (!g_ms_lista[m].activo) continue;
+            if (cursor_global < acumulado + g_ms_lista[m].tamanio) {
+                ms_destino = m;
+                offset_destino = cursor_global - acumulado;
+                break;
+            }
+            acumulado += g_ms_lista[m].tamanio;
+        }
+        if (ms_destino == -1) {
+            log_error(g_logger, "Compactación: cursor_global fuera de rango");
+            goto unlock;
+        }
+
+        // Si el trozo ya está en esa posición exacta, solo avanzar cursor
+        if (trozo->ms_id == ms_destino && trozo->dir_fisica_ms == offset_destino) {
+            cursor_global += tam;
+            continue;
+        }
+
+        // Leer del origen
+        int fd_origen = g_ms_lista[trozo->ms_id].fd;
+        void *buf = malloc(tam);
+        if (!buf) {
+            log_error(g_logger, "Compactación: malloc falló");
+            goto unlock;
+        }
+
+        pthread_mutex_lock(&mutex_ms_ops[trozo->ms_id]);
+        enviar_int32(fd_origen, OP_LEER_MS);
+        enviar_int32(fd_origen, trozo->dir_fisica_ms);
+        enviar_int32(fd_origen, tam);
+        int32_t resp, tam_r;
+        recibir_int32(fd_origen, &resp);
+        recibir_int32(fd_origen, &tam_r);
+        recv(fd_origen, buf, tam_r, MSG_WAITALL);
+        pthread_mutex_unlock(&mutex_ms_ops[trozo->ms_id]);
+
+        // Escribir en el destino
+        int fd_destino = g_ms_lista[ms_destino].fd;
+        pthread_mutex_lock(&mutex_ms_ops[ms_destino]);
+        enviar_int32(fd_destino, OP_ESCRIBIR_MS);
+        enviar_int32(fd_destino, offset_destino);
+        enviar_int32(fd_destino, tam);
+        send(fd_destino, buf, tam, MSG_NOSIGNAL);
+        recibir_int32(fd_destino, &resp);
+        pthread_mutex_unlock(&mutex_ms_ops[ms_destino]);
+
+        free(buf);
+
+        // Actualizar el trozo
+        trozo->ms_id = ms_destino;
+        trozo->dir_fisica_ms = offset_destino;
+
+        cursor_global += tam;
+    }
+
+    // 3. Reconstruir la lista de huecos
+    g_huecos_count = 0;
+    int32_t acum = 0;
+    for (int m = 0; m < g_ms_count; m++) {
+        if (!g_ms_lista[m].activo) continue;
+        int32_t ocupado = 0;
+        if (cursor_global > acum) {
+            ocupado = (cursor_global - acum < g_ms_lista[m].tamanio) ?
+                      (cursor_global - acum) : g_ms_lista[m].tamanio;
+        }
+        int32_t libre = g_ms_lista[m].tamanio - ocupado;
+        if (libre > 0) {
             t_hueco h = {
-                .activo  = true,
-                .ms_id   = ms,
-                .base    = cursor,
-                .tamanio = espacio_libre
+                .activo = true,
+                .ms_id = m,
+                .base = ocupado,
+                .tamanio = libre
             };
             g_huecos[g_huecos_count++] = h;
             log_info(g_logger,
-                     "COMPACT: MS=%d hueco único [%d, %d) = %d bytes",
-                     ms, cursor, cursor + espacio_libre, espacio_libre);
+                     "COMPACT: MS=%d hueco [%d, %d) = %d bytes",
+                     m, ocupado, ocupado + libre, libre);
         }
+        acum += g_ms_lista[m].tamanio;
+        if (cursor_global <= acum) break; // ya no hay más datos
     }
- 
+
+unlock:
     pthread_mutex_unlock(&mutex_procesos);
     pthread_mutex_unlock(&mutex_ms_lista);
     pthread_mutex_unlock(&mutex_huecos);
- 
+
     log_info(g_logger, "## Fin de compactación");
 }
 
@@ -1231,56 +1256,42 @@ void _km_responder_segmento_ok(int fd_ks, int32_t pid, int32_t seg_id)
 }
 
 
-/* km_crear_segmento
- *
- * Flujo:
- *   1. Intentar km_asignar_segmento() con la estrategia configurada.
- *   2. Si falla pero hay memoria total suficiente → compactar y reintentar.
- *   3. Si aún falla → OP_ERROR.
- *   4. Si OK → enviar OP_OK + n_trozos + detalle de cada trozo.
- *   Nota: No hay restricción de tamaño sobre segmentos. SEGMENT_MAX_SIZE solo define
- *         el tamaño lógico de la MMU para traducción de direcciones.
- */
 void km_crear_segmento(int fd_ks, int32_t pid, int32_t seg_id, int32_t tam_seg)
 {
     log_info(g_logger, "## PID: %d - Crear segmento %d de %d bytes", pid, seg_id, tam_seg);
- 
 
- 
     /* ── Intento 1: asignar directamente ── */
     if (km_asignar_segmento(pid, seg_id, tam_seg)) {
         log_info(g_logger, "## PID: %d - Segmento %d asignado sin compactación", pid, seg_id);
         _km_responder_segmento_ok(fd_ks, pid, seg_id);
         return;
     }
-    
+
     log_info(g_logger, "## PID: %d - Asignación directa falló para segmento %d (tam=%d)", pid, seg_id, tam_seg);
-    
+
     /* ── ¿Hay memoria total suficiente aunque fragmentada? ── */
     int32_t libre_total = 0;
     pthread_mutex_lock(&mutex_huecos);
     for (int i = 0; i < g_huecos_count; i++)
         if (g_huecos[i].activo) libre_total += g_huecos[i].tamanio;
     pthread_mutex_unlock(&mutex_huecos);
-    
+
     log_info(g_logger, "## PID: %d - Análisis de memoria: necesita=%d, libre_total=%d, huecos=%d",
              pid, tam_seg, libre_total, g_huecos_count);
-    
+
     if (libre_total < tam_seg) {
         log_error(g_logger,
-                  "## PID: %d - Sin memoria para segmento %d "
-                  "(necesita=%d, libre_total=%d)",
+                  "## PID: %d - Sin memoria para segmento %d (necesita=%d, libre_total=%d)",
                   pid, seg_id, tam_seg, libre_total);
         enviar_int32(fd_ks, OP_ERROR);
         return;
     }
- 
+
     /* ── Notificar al KS que debe desalojar CPUs para compactar ── */
     log_info(g_logger,
-             "## PID: %d - Memoria fragmentada (necesita=%d, libre=%d) — "
-             "solicitando compactación al KS",
+             "## PID: %d - Memoria fragmentada (necesita=%d, libre=%d) — solicitando compactación al KS",
              pid, tam_seg, libre_total);
- 
+
     pthread_mutex_lock(&mutex_fd_ks);
     if (fd_ks_global == -1) {
         pthread_mutex_unlock(&mutex_fd_ks);
@@ -1288,11 +1299,9 @@ void km_crear_segmento(int fd_ks, int32_t pid, int32_t seg_id, int32_t tam_seg)
         enviar_int32(fd_ks, OP_ERROR);
         return;
     }
-    
-    log_info(g_logger, "## PID: %d - Enviando OP_INICIAR_COMPACT (opcode=%d) al KS", pid, OP_INICIAR_COMPACT);
     enviar_int32(fd_ks_global, OP_INICIAR_COMPACT);
     pthread_mutex_unlock(&mutex_fd_ks);
-    
+
     /* ── Esperar confirmación de desalojo (OP_CONFIRMAR_DESALOJO) ── */
     log_info(g_logger, "## PID: %d - Esperando OP_CONFIRMAR_DESALOJO del KS", pid);
     int32_t confirm;
@@ -1301,8 +1310,6 @@ void km_crear_segmento(int fd_ks, int32_t pid, int32_t seg_id, int32_t tam_seg)
         enviar_int32(fd_ks, OP_ERROR);
         return;
     }
-    
-    log_info(g_logger, "## PID: %d - Respuesta recibida del KS: opcode=%d (esperado=%d)", pid, confirm, OP_CONFIRMAR_DESALOJO);
     if (confirm != OP_CONFIRMAR_DESALOJO) {
         log_error(g_logger,
                   "## PID: %d - No se recibió confirmación de desalojo (got=%d, expected=%d)",
@@ -1311,17 +1318,17 @@ void km_crear_segmento(int fd_ks, int32_t pid, int32_t seg_id, int32_t tam_seg)
         return;
     }
     log_info(g_logger, "## PID: %d - Confirmación de desalojo recibida — iniciando compactación", pid);
- 
-    /* ── Compactar ── */
-    km_compactar();   /* definida en kernel_m_memory.c */
- 
+
+    /* ── Compactar globalmente ── */
+    km_compactar_global();  // ahora es la única compactación
+
     /* ── Notificar fin de compactación al KS ── */
     pthread_mutex_lock(&mutex_fd_ks);
     if (fd_ks_global != -1)
         enviar_int32(fd_ks_global, OP_FIN_COMPACT);
     pthread_mutex_unlock(&mutex_fd_ks);
- 
-    /* ── Intento 2: asignar después de compactar ── */
+
+    /* ── Reintentar asignación después de compactar ── */
     if (!km_asignar_segmento(pid, seg_id, tam_seg)) {
         log_error(g_logger,
                   "## PID: %d - Sin memoria incluso tras compactación (seg=%d, tam=%d)",
@@ -1329,10 +1336,9 @@ void km_crear_segmento(int fd_ks, int32_t pid, int32_t seg_id, int32_t tam_seg)
         enviar_int32(fd_ks, OP_ERROR);
         return;
     }
- 
+
     _km_responder_segmento_ok(fd_ks, pid, seg_id);
 }
-
 
 /* km_eliminar_segmento */
 void km_eliminar_segmento(int fd_ks, int32_t pid, int32_t seg_id)
@@ -1671,20 +1677,24 @@ void km_atender_cpu(t_log *logger, int fd_cpu)
                 int32_t n_activos = 0;
                 for (int i = 0; i < g_ms_count; i++)
                     if (g_ms_lista[i].activo) n_activos++;
- 
+
                 enviar_int32(fd_cpu, n_activos);
- 
+
                 for (int i = 0; i < g_ms_count; i++) {
                     if (!g_ms_lista[i].activo) continue;
+                    // 1. Enviar ms_id (índice interno de KM)
+                    enviar_int32(fd_cpu, i);
+                    // 2. IP
                     int32_t largo = (int32_t)strlen(g_ms_lista[i].ip);
                     enviar_int32(fd_cpu, largo);
                     send(fd_cpu, g_ms_lista[i].ip, largo, MSG_NOSIGNAL);
+                    // 3. Puerto
                     enviar_int32(fd_cpu, g_ms_lista[i].puerto_cpus);
+                    // 4. Tamaño
                     enviar_int32(fd_cpu, g_ms_lista[i].tamanio);
-                    log_info(logger,
-                             "CPU %d — GET_MS_LIST: MS %d ip=%s puerto=%d tam=%d",
-                             id_cpu, i, g_ms_lista[i].ip,
-                             g_ms_lista[i].puerto_cpus, g_ms_lista[i].tamanio);
+                    log_info(logger, "CPU %d — GET_MS_LIST: MS %d ip=%s puerto=%d tam=%d",
+                            id_cpu, i, g_ms_lista[i].ip,
+                            g_ms_lista[i].puerto_cpus, g_ms_lista[i].tamanio);
                 }
                 pthread_mutex_unlock(&mutex_ms_lista);
                 break;

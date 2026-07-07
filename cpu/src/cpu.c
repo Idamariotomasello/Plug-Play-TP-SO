@@ -842,26 +842,54 @@ int main(int argc, char *argv[])
     recibir_int32(fd_kernel_memory, &n_ms);
 
     for (int i = 0; i < n_ms; i++) {
+        int32_t ms_id;
         char ip_ms[64];
         int32_t puerto_ms, tamanio_ms, largo_ip;
 
-        recibir_int32(fd_kernel_memory, &largo_ip);
-        recv(fd_kernel_memory, ip_ms, largo_ip, MSG_WAITALL);
+        // Leer ms_id
+        if (!recibir_int32(fd_kernel_memory, &ms_id)) {
+            log_error(logger, "Error recibiendo ms_id");
+            goto cleanup;
+        }
+
+        if (!recibir_int32(fd_kernel_memory, &largo_ip)) {
+            log_error(logger, "Error recibiendo largo IP");
+            goto cleanup;
+        }
+        if (recv(fd_kernel_memory, ip_ms, largo_ip, MSG_WAITALL) != largo_ip) {
+            log_error(logger, "Error recibiendo IP");
+            goto cleanup;
+        }
         ip_ms[largo_ip] = '\0';
-        recibir_int32(fd_kernel_memory, &puerto_ms);
-        recibir_int32(fd_kernel_memory, &tamanio_ms);
+
+        if (!recibir_int32(fd_kernel_memory, &puerto_ms)) {
+            log_error(logger, "Error recibiendo puerto");
+            goto cleanup;
+        }
+        if (!recibir_int32(fd_kernel_memory, &tamanio_ms)) {
+            log_error(logger, "Error recibiendo tamaño");
+            goto cleanup;
+        }
 
         int fd = conectar_a_servidor(logger, ip_ms, puerto_ms);
-        if (fd == -1) { log_warning(logger, "MS %d no disponible", i); continue; }
+        if (fd == -1) {
+            log_warning(logger, "MS %d no disponible", ms_id);
+            continue;
+        }
 
-        if (!enviar_handshake(logger, fd, TIPO_CPU)) { close(fd); continue; }
+        if (!enviar_handshake(logger, fd, TIPO_CPU)) {
+            close(fd);
+            continue;
+        }
         enviar_int32(fd, g_id_cpu);
 
-        g_ms_fds[i]      = fd;
-        g_ms_tamanios[i] = tamanio_ms;
+        // Usar ms_id como índice en los arreglos
+        g_ms_fds[ms_id] = fd;
+        g_ms_tamanios[ms_id] = tamanio_ms;
         g_ms_count_cpu++;
+
         log_info(logger, "## CPU %d conectada a MS %d (%s:%d, %d bytes)",
-                g_id_cpu, i, ip_ms, puerto_ms, tamanio_ms);
+                g_id_cpu, ms_id, ip_ms, puerto_ms, tamanio_ms);
     }
  
     pthread_t hilo_kernel_scheduler_interrupt;
