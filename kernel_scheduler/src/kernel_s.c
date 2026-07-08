@@ -497,6 +497,8 @@ t_pcb *ks_crear_pcb(int32_t pid, int32_t prioridad)
             pcb = &g_ks_pcbs[i];
             g_ks_pcbs[i].suspension_en_curso      = false;
             g_ks_pcbs[i].dessuspender_al_terminar = false;
+            g_ks_pcbs[i].stdin_pendiente          = false;
+            g_ks_pcbs[i].stdin_buffer    = NULL;
             break;
         }
     }
@@ -670,96 +672,95 @@ void ks_io_request_completo(t_io_request *req, void *datos, int32_t datos_size)
         return;
     }
 
-    /* Escribir datos de STDIN en memoria (independiente del estado) */
+    pthread_mutex_lock(&g_mutex_ks_pcbs);
+    e_estado_proceso estado_actual = pcb->estado;
+    bool en_curso = pcb->suspension_en_curso;
+    pthread_mutex_unlock(&g_mutex_ks_pcbs);
+
     if (req->subtipo == OP_IO_STDIN) {
-        log_info(logger,
-                 "## (%d) - STDIN completado: %d bytes recibidos, escribiendo en KM...",
+
+        if (estado_actual == ESTADO_SUSP_BLOCK) {
+            if (en_curso) {
+                pthread_mutex_lock(&g_mutex_ks_pcbs);
+                pcb->dessuspender_al_terminar = true;
+                free(pcb->stdin_buffer);
+                pcb->stdin_buffer      = malloc(datos_size);
+                memcpy(pcb->stdin_buffer, datos, datos_size);
+                pcb->stdin_dir_logica  = req->dir_logica;
+                pcb->stdin_tamanio     = req->tamanio;
+                pcb->stdin_pendiente   = true;
+                pthread_mutex_unlock(&g_mutex_ks_pcbs);
+
+                log_info(logger,
+                    "## (%d) - STDIN completado con suspensión en curso — "
+                    "datos guardados para escribir tras des-suspensión",
+                    pcb->pid);
+                return;
+            }
+
+            /* Suspensión ya estable: primero restaurar memoria desde SWAP,
+             * recién después escribir los datos de STDIN. */
+            log_info(logger,
+                "## (%d) - STDIN completado en SUSP_BLOCK — des-suspendiendo antes de escribir",
+                pcb->pid);
+
+            if (!ks_dessuspender_proceso(pcb)) {
+                log_error(logger, "## (%d) - Des-suspensión falló — proceso a EXIT", pcb->pid);
+                ks_pasar_a_exit(pcb);
+                return;
+            }
+
+            if (!ks_escribir_datos(pcb->pid, req->dir_logica, req->tamanio, datos)) {
+                log_error(logger, "## (%d) - STDIN: fallo escritura tras des-suspensión (SEG_FAULT)", pcb->pid);
+                ks_pasar_a_exit(pcb);
+                return;
+            }
+
+            log_info(logger, "## (%d) - STDIN: datos escritos correctamente en memoria", pcb->pid);
+            ks_encolar_ready(pcb);
+            return;
+        }
+
+        /* Camino normal: proceso sigue en BLOCK (no fue suspendido) */
+        log_info(logger, "## (%d) - STDIN completado: %d bytes recibidos, escribiendo en KM...",
                  req->pid, datos_size);
 
         if (!ks_escribir_datos(req->pid, req->dir_logica, req->tamanio, datos)) {
-            log_error(logger,
-                      "## (%d) - STDIN: fallo escritura en memoria (SEG_FAULT)",
-                      req->pid);
+            log_error(logger, "## (%d) - STDIN: fallo escritura en memoria (SEG_FAULT)", req->pid);
             ks_pasar_a_exit(pcb);
             return;
         }
-        log_info(logger, "## (%d) - STDIN: datos escritos correctamente en memoria",
-                 req->pid);
-    } else {
-        log_info(logger, "## (%d) - IO %s completado",
-                 req->pid, ks_nombre_io(req->subtipo));
+        log_info(logger, "## (%d) - STDIN: datos escritos correctamente en memoria", req->pid);
+        ks_encolar_ready(pcb);
+        return;
     }
 
-    /* Leer estado actual con el mutex tomado para evitar race con el hilo
-     * de suspensión que podría estar modificándolo al mismo tiempo */
-    pthread_mutex_lock(&g_mutex_ks_pcbs);
-    e_estado_proceso estado_actual = pcb->estado;
-    pthread_mutex_unlock(&g_mutex_ks_pcbs);
+    /* STDOUT / SLEEP: sin cambios respecto al código actual */
+    log_info(logger, "## (%d) - IO %s completado", req->pid, ks_nombre_io(req->subtipo));
 
     if (estado_actual == ESTADO_BLOCK) {
-        /* Caso normal: el timeout no venció, encolamos directo */
-        log_info(logger,
-                 "## (%d) - IO completado en tiempo — proceso vuelve a READY",
-                 pcb->pid);
+        log_info(logger, "## (%d) - IO completado en tiempo — proceso vuelve a READY", pcb->pid);
         ks_encolar_ready(pcb);
-
     } else if (estado_actual == ESTADO_SUSP_BLOCK) {
-
-        pthread_mutex_lock(&g_mutex_ks_pcbs);
-        bool en_curso = pcb->suspension_en_curso;
-        pthread_mutex_unlock(&g_mutex_ks_pcbs);
-
         if (en_curso) {
-            // El KM todavía está procesando el swap. No podemos usar
-            // mutex_km_socket porque lo tiene ks_hilo_suspension.
-            // Marcar el flag para que ks_hilo_suspension maneje el dessuspender
-            // cuando reciba el OP_OK del KM.
             pthread_mutex_lock(&g_mutex_ks_pcbs);
             pcb->dessuspender_al_terminar = true;
             pthread_mutex_unlock(&g_mutex_ks_pcbs);
-
-            log_info(logger,
-                    "## (%d) - IO completado pero suspensión en curso — "
-                    "marcando dessuspender_al_terminar",
-                    pcb->pid);
-            // No llamar a ks_encolar_ready acá.
-            // ks_hilo_suspension lo encolará cuando termine.
-
+            log_info(logger, "## (%d) - IO completado pero suspensión en curso — marcando dessuspender_al_terminar", pcb->pid);
         } else {
-            // La suspensión ya completó, el proceso está en SUSP_BLOCK estable.
-            // Des-suspender normalmente (código que ya existía):
-            log_info(logger,
-                    "## (%d) - IO completado en SUSP_BLOCK — des-suspendiendo",
-                    pcb->pid);
-
-            pthread_mutex_lock(&mutex_km_socket);
-            enviar_int32(fd_kernel_memory, OP_DESSUSPENDER_PROCESO);
-            enviar_int32(fd_kernel_memory, pcb->pid);
-            int32_t resp;
-            bool recv_ok = ks_recibir_de_km(&resp);
-            pthread_mutex_unlock(&mutex_km_socket);
-            bool ok = recv_ok && resp == OP_OK;
-
-            if (ok) {
-                log_info(logger,
-                        "## (%d) - Des-suspensión OK — proceso vuelve a READY",
-                        pcb->pid);
-                ks_cambiar_estado(pcb, ESTADO_BLOCK);
+            log_info(logger, "## (%d) - IO completado en SUSP_BLOCK — des-suspendiendo", pcb->pid);
+            if (ks_dessuspender_proceso(pcb)) {
                 ks_encolar_ready(pcb);
             } else {
-                log_error(logger,
-                        "## (%d) - Des-suspensión falló — proceso pasa a EXIT",
-                        pcb->pid);
+                log_error(logger, "## (%d) - Des-suspensión falló — proceso pasa a EXIT", pcb->pid);
                 ks_pasar_a_exit(pcb);
             }
         }
     } else {
-        log_warning(logger,
-                    "## (%d) - IO completado pero proceso en estado inesperado: %s",
+        log_warning(logger, "## (%d) - IO completado pero proceso en estado inesperado: %s",
                     pcb->pid, ks_nombre_estado(estado_actual));
     }
 }
-
 
 void *ks_io_worker(void *arg)
 {
@@ -959,15 +960,38 @@ void *ks_hilo_suspension(void *arg)
                         pthread_mutex_unlock(&mutex_km_socket);
 
                         if (recv_ok2 && resp2 == OP_OK) {
-                            log_info(logger,
-                                    "## (%d) - Des-suspensión tardía OK — proceso va a READY",
-                                    pcb->pid);
-                            ks_cambiar_estado(pcb, ESTADO_BLOCK); // ks_encolar_ready lo pasará a READY
+                            log_info(logger, "## (%d) - Des-suspensión tardía OK — proceso va a READY", pcb->pid);
+
+                            /* Si había un STDIN pendiente esperando esta des-suspensión, escribirlo ahora */
+                            pthread_mutex_lock(&g_mutex_ks_pcbs);
+                            bool hay_stdin_pendiente = pcb->stdin_pendiente;
+                            void *buf = pcb->stdin_buffer;
+                            uint32_t dir = pcb->stdin_dir_logica;
+                            int32_t  tam = pcb->stdin_tamanio;
+                            pcb->stdin_pendiente = false;
+                            pcb->stdin_buffer = NULL;
+                            pthread_mutex_unlock(&g_mutex_ks_pcbs);
+
+                            if (hay_stdin_pendiente) {
+                                bool wr_ok = ks_escribir_datos(pcb->pid, dir, tam, buf);
+                                free(buf);
+                                if (!wr_ok) {
+                                    log_error(logger,
+                                        "## (%d) - STDIN pendiente: fallo escritura tras des-suspensión tardía (SEG_FAULT)",
+                                        pcb->pid);
+                                    ks_pasar_a_exit(pcb);
+                                    continue;
+                                }
+                                log_info(logger, "## (%d) - STDIN pendiente: datos escritos correctamente tras des-suspensión", pcb->pid);
+                            }
+
+                            ks_cambiar_estado(pcb, ESTADO_BLOCK);
                             ks_encolar_ready(pcb);
                         } else {
-                            log_error(logger,
-                                    "## (%d) - Des-suspensión tardía falló — proceso pasa a EXIT",
-                                    pcb->pid);
+                            free(pcb->stdin_buffer);
+                            pcb->stdin_buffer = NULL;
+                            pcb->stdin_pendiente = false;
+                            log_error(logger, "## (%d) - Des-suspensión tardía falló — proceso pasa a EXIT", pcb->pid);
                             ks_pasar_a_exit(pcb);
                         }
                         // El mutex de pcbs ya fue soltado arriba antes del dessuspender,

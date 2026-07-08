@@ -233,6 +233,10 @@ typedef struct s_pcb {
     struct timespec tiempo_block_inicio;
     bool suspension_en_curso; 
     bool dessuspender_al_terminar; // si true, al terminar de ejecutar se pasa a SUSP_READY
+    bool     stdin_pendiente;
+    uint32_t stdin_dir_logica;
+    int32_t  stdin_tamanio;
+    void    *stdin_buffer;
 } t_pcb;
 
 typedef struct s_proceso_esperando {
