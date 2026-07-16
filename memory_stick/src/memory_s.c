@@ -488,5 +488,20 @@ int main(int argc, char *argv[])
     config_destroy(config);
     log_destroy(logger);
     return 0;
+
+ cleanup:
+    if (fd_km > 0)
+        close(fd_km);
+
+    if (g_memoria)
+        free(g_memoria);
+
+    if (config)
+        config_destroy(config);
+
+    if (logger)
+        log_destroy(logger);
+
+    return 1;
 }
 
