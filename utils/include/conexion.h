@@ -1,6 +1,7 @@
 #ifndef CONEXION_H_
 #define CONEXION_H_
 
+#include <ifaddrs.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
