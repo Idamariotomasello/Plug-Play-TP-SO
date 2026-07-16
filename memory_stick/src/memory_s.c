@@ -404,7 +404,7 @@ int main(int argc, char *argv[])
 
     /* IP propia (leída del config o detectada) */
     char *ip_propia = config_get_string_value(config, "IP_ESCUCHA");
-    if (!ip_propia) ip_propia = strdup("127.0.0.1");
+    if (!ip_propia) ip_propia = strdup("192.168.3.34");
     int32_t largo_ip = (int32_t)strlen(ip_propia);
     enviar_int32(fd_km, largo_ip);
     send(fd_km, ip_propia, largo_ip, MSG_NOSIGNAL);
