@@ -317,6 +317,40 @@ void *hilo_servidor_cpus(void *varg)
     free(arg);
     return NULL;
 }
+
+char *obtener_ip_local(void)
+{
+    struct ifaddrs *ifaddr, *ifa;
+    char *ip = NULL;
+
+    if (getifaddrs(&ifaddr) == -1)
+        return NULL;
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next)
+    {
+        if (!ifa->ifa_addr)
+            continue;
+
+        if (ifa->ifa_addr->sa_family == AF_INET)
+        {
+            char addr[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET,
+                      &((struct sockaddr_in *)ifa->ifa_addr)->sin_addr,
+                      addr,
+                      sizeof(addr));
+
+            /* Ignorar localhost */
+            if (strcmp(addr, "127.0.0.1") != 0)
+            {
+                ip = strdup(addr);
+                break;
+            }
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return ip;
+}
  
 /* main
  * Uso: ./memory_stick memory_s.config <tamanio_en_bytes>
@@ -403,8 +437,15 @@ int main(int argc, char *argv[])
     enviar_int32(fd_km, g_tamanio);
 
     /* IP propia (leída del config o detectada) */
-    char *ip_propia = config_get_string_value(config, "IP_ESCUCHA");
-    if (!ip_propia) ip_propia = strdup("192.168.3.34");
+    char *ip_propia = obtener_ip_local();
+    if (!ip_propia)
+    {
+        log_error(logger, "No se pudo determinar la IP local");
+        goto cleanup;
+    }
+    
+    log_info(logger, "IP local detectada: %s", ip_propia);
+    
     int32_t largo_ip = (int32_t)strlen(ip_propia);
     enviar_int32(fd_km, largo_ip);
     send(fd_km, ip_propia, largo_ip, MSG_NOSIGNAL);
