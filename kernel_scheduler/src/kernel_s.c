@@ -453,8 +453,79 @@ void ks_notificar_fin_proceso(t_pcb *pcb)
 
     /* Liberar el slot del PCB para que pueda reutilizarse */
     pthread_mutex_lock(&g_mutex_ks_pcbs);
+
+    /* Liberar cualquier buffer de STDIN pendiente que haya quedado
+     * colgado de un ciclo de suspensión/des-suspensión incompleto */
+    if (pcb->stdin_buffer) {
+        log_warning(logger,
+                     "## (%d) - Liberando stdin_buffer pendiente al finalizar proceso",
+                     pcb->pid);
+        free(pcb->stdin_buffer);
+        pcb->stdin_buffer    = NULL;
+        pcb->stdin_pendiente = false;
+    }
+
     pcb->activo = false;
     pthread_mutex_unlock(&g_mutex_ks_pcbs);
+}
+
+void ks_liberar_mutexes_de_proceso(t_pcb *pcb)
+{
+    pthread_mutex_lock(&g_mutex_tabla_mutex);
+
+    for (int i = 0; i < KS_MAX_MUTEX; i++) {
+        t_mutex *m = &g_mutexes[i];
+        if (!m->activo) continue;
+
+        /* Caso 1: el proceso era el dueño del mutex */
+        if (m->tomado && m->pid_duenio == pcb->pid) {
+            if (m->cola_espera) {
+                t_proceso_esperando *nodo = m->cola_espera;
+                m->cola_espera = nodo->siguiente;
+
+                t_pcb *siguiente = nodo->pcb;
+                free(nodo);
+
+                m->pid_duenio = siguiente->pid;
+                m->prioridad_original_duenio = siguiente->prioridad;
+
+                log_info(logger,
+                         "## (%d) - EXIT: mutex '%s' cedido a PID %d",
+                         pcb->pid, m->nombre, siguiente->pid);
+
+                pthread_mutex_unlock(&g_mutex_tabla_mutex);
+                ks_encolar_ready(siguiente);
+                pthread_mutex_lock(&g_mutex_tabla_mutex);
+            } else {
+                m->tomado     = false;
+                m->pid_duenio = -1;
+                log_info(logger,
+                         "## (%d) - EXIT: mutex '%s' liberado (nadie esperaba)",
+                         pcb->pid, m->nombre);
+            }
+        }
+
+        /* Caso 2: el proceso estaba esperando este mutex (mutex ajeno) —
+         * sacarlo de la cola para no dejar un nodo colgante */
+        t_proceso_esperando *prev = NULL;
+        t_proceso_esperando *cur  = m->cola_espera;
+        while (cur) {
+            if (cur->pcb->pid == pcb->pid) {
+                if (prev) prev->siguiente = cur->siguiente;
+                else      m->cola_espera  = cur->siguiente;
+
+                log_info(logger,
+                         "## (%d) - EXIT: removido de la cola de espera del mutex '%s'",
+                         pcb->pid, m->nombre);
+                free(cur);
+                break; /* un proceso solo puede estar una vez en la cola de un mutex */
+            }
+            prev = cur;
+            cur  = cur->siguiente;
+        }
+    }
+
+    pthread_mutex_unlock(&g_mutex_tabla_mutex);
 }
 
 /* ks_pasar_a_exit
@@ -464,6 +535,7 @@ void ks_notificar_fin_proceso(t_pcb *pcb)
 void ks_pasar_a_exit(t_pcb *pcb)
 {
     ks_cambiar_estado(pcb, ESTADO_EXIT);
+    ks_liberar_mutexes_de_proceso(pcb);
     ks_notificar_fin_proceso(pcb);
 }
 

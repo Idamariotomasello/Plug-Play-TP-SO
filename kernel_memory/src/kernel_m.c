@@ -628,14 +628,10 @@ void km_compactar_global(void)
 
     t_commit_pendiente *commits = malloc(n_trozos * sizeof(t_commit_pendiente));
     t_contador_seg     *contadores = malloc(n_trozos * sizeof(t_contador_seg));
-    void              **buffers = malloc(n_trozos * sizeof(void*));
+    void **buffers = calloc(n_trozos, sizeof(void*));
 
     if (!commits || !contadores || !buffers) {
         log_error(g_logger, "COMPACT: malloc falló para estructuras auxiliares");
-        free(trozos);
-        free(commits);
-        free(contadores);
-        free(buffers);
         goto liberar_salida;
     }
 

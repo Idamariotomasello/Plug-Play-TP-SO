@@ -32,6 +32,7 @@ typedef struct {
 // Variables globales
 int fd_kernel_memory;
 
+void ks_liberar_mutexes_de_proceso(t_pcb *pcb);
 t_pcb *ks_buscar_pcb(int32_t pid);
 void   ks_cambiar_estado(t_pcb *pcb, e_estado_proceso nuevo);
 void   ks_encolar_ready(t_pcb *pcb);
