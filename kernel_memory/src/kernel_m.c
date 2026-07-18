@@ -245,80 +245,38 @@ void km_hueco_agregar(const t_hueco *h)
     g_huecos[g_huecos_count++] = *h;
 }
 
-/* km_mergear_huecos
- * Fusiona huecos adyacentes dentro del mismo MS.
- * Después de liberar un trozo, llama con ms_id del trozo.
- *
- * Algoritmo:
- *   1. Recopila todos los huecos activos del ms_id dado.
- *   2. Los ordena por base (burbuja; lista corta).
- *   3. Fusiona los que se tocan: [base, base+tamanio) contiguo al siguiente.
- *   4. Reescribe la lista global eliminando los fusionados.
- */
+/* Fusiona todos los huecos adyacentes en el espacio físico global. */
 void km_mergear_huecos(int32_t ms_id)
 {
+    (void)ms_id;
     pthread_mutex_lock(&mutex_huecos);
 
-    log_info(g_logger, "MERGE: iniciando para MS=%d", ms_id);
- 
-    /* --- 1. copiar huecos del ms_id a arreglo temporal --- */
-    t_hueco tmp[MAX_HUECOS];
     int n = 0;
-    for (int i = 0; i < g_huecos_count; i++) {
-        if (g_huecos[i].activo && g_huecos[i].ms_id == ms_id)
-            tmp[n++] = g_huecos[i];
-    }
- 
-    if (n < 2) {
-        pthread_mutex_unlock(&mutex_huecos);
-        return;
-    }
- 
-    /* --- 2. ordenar por base (burbuja) --- */
+    for (int i = 0; i < g_huecos_count; i++)
+        if (g_huecos[i].activo)
+            g_huecos[n++] = g_huecos[i];
+    g_huecos_count = n;
+
     for (int i = 0; i < n - 1; i++)
         for (int j = i + 1; j < n; j++)
-            if (tmp[j].base < tmp[i].base) {
-                t_hueco aux = tmp[i]; tmp[i] = tmp[j]; tmp[j] = aux;
+            if (g_huecos[j].base < g_huecos[i].base) {
+                t_hueco aux = g_huecos[i];
+                g_huecos[i] = g_huecos[j];
+                g_huecos[j] = aux;
             }
- 
-    /* --- 3. merge --- */
-    for (int i = 0; i < n - 1; i++) {
-        if (!tmp[i].activo) continue;
-        if (tmp[i].base + tmp[i].tamanio == tmp[i + 1].base) {
-            /* adyacentes → fusionar en i, invalidar i+1 */
-            tmp[i].tamanio += tmp[i + 1].tamanio;
-            tmp[i + 1].activo = false;
-            log_info(g_logger,
-                     "MERGE: MS=%d [%d,%d) + [%d,%d) → [%d,%d)",
-                     ms_id,
-                     tmp[i].base, tmp[i].base + tmp[i].tamanio - tmp[i + 1].tamanio,
-                     tmp[i + 1].base, tmp[i + 1].base + tmp[i + 1].tamanio,
-                     tmp[i].base, tmp[i].base + tmp[i].tamanio);
-        }
-    }
- 
-    /* --- 4. reescribir lista global --- */
-    /* Eliminar todos los del ms_id de g_huecos */
-    int nuevo_count = 0;
-    for (int i = 0; i < g_huecos_count; i++) {
-        if (g_huecos[i].activo && g_huecos[i].ms_id != ms_id)
-            g_huecos[nuevo_count++] = g_huecos[i];
-    }
-    /* Agregar los fusionados */
+
+    int destino = 0;
     for (int i = 0; i < n; i++) {
-        if (tmp[i].activo)
-            g_huecos[nuevo_count++] = tmp[i];
-    }
-    g_huecos_count = nuevo_count;
- 
-    // Después del merge, mostrar el nuevo estado
-    log_info(g_logger, "MERGE: estado final de huecos para MS=%d:", ms_id);
-    for (int i = 0; i < g_huecos_count; i++) {
-        if (g_huecos[i].activo && g_huecos[i].ms_id == ms_id) {
-            log_info(g_logger, "  MS=%d base=%d tam=%d",
-                     g_huecos[i].ms_id, g_huecos[i].base, g_huecos[i].tamanio);
+        if (destino > 0 &&
+            g_huecos[destino - 1].base + g_huecos[destino - 1].tamanio ==
+            g_huecos[i].base) {
+            g_huecos[destino - 1].tamanio += g_huecos[i].tamanio;
+            g_huecos[destino - 1].ms_id = -1;
+        } else {
+            g_huecos[destino++] = g_huecos[i];
         }
     }
+    g_huecos_count = destino;
 
     pthread_mutex_unlock(&mutex_huecos);
 }
@@ -341,35 +299,105 @@ t_hueco *km_buscar_hueco(int32_t tamanio)
 
         switch (g_strategy) {
             case KM_STRATEGY_FIRST_FIT:
-                log_info(g_logger, "  FIRST_FIT: seleccionado MS=%d base=%d tam=%d",
-                         h->ms_id, h->base, h->tamanio);
+                log_info(g_logger, "  FIRST_FIT: seleccionado base_global=%d tam=%d",
+                         h->base, h->tamanio);
                 return h;   /* primer ajuste: retorna de inmediato */
 
             case KM_STRATEGY_BEST_FIT:
                 if (!seleccion || h->tamanio < seleccion->tamanio) {
                     seleccion = h;
-                    log_info(g_logger, "  BEST_FIT: nuevo candidato MS=%d base=%d tam=%d",
-                             h->ms_id, h->base, h->tamanio);
+                    log_info(g_logger, "  BEST_FIT: nuevo candidato base_global=%d tam=%d",
+                             h->base, h->tamanio);
                 }
                 break;
 
             case KM_STRATEGY_WORST_FIT:
                 if (!seleccion || h->tamanio > seleccion->tamanio) {
                     seleccion = h;
-                    log_info(g_logger, "  WORST_FIT: nuevo candidato MS=%d base=%d tam=%d (mayor)",
-                             h->ms_id, h->base, h->tamanio);
+                    log_info(g_logger, "  WORST_FIT: nuevo candidato base_global=%d tam=%d (mayor)",
+                             h->base, h->tamanio);
                 }
                 break;
         }
     }
 
     if (seleccion) {
-        log_info(g_logger, "BUSCAR_HUECO: seleccionado MS=%d base=%d tam=%d",
-                 seleccion->ms_id, seleccion->base, seleccion->tamanio);
+        log_info(g_logger, "BUSCAR_HUECO: seleccionado base_global=%d tam=%d",
+                 seleccion->base, seleccion->tamanio);
     } else {
         log_info(g_logger, "BUSCAR_HUECO: ningún hueco suficiente");
     }
     return seleccion;
+}
+
+/* Reserva dentro de un único MS. Se usa para restaurar un trozo de SWAP sin
+ * alterar su representación; los segmentos nuevos sí pueden cruzar MS. */
+static bool km_reservar_hueco_en_un_ms(int32_t tamanio,
+                                       int32_t *ms_id_out,
+                                       int32_t *offset_out)
+{
+    int mejor_h = -1, mejor_ms = -1;
+    int32_t mejor_base = 0, mejor_disponible = 0;
+
+    for (int i = 0; i < g_huecos_count; i++) {
+        t_hueco *h = &g_huecos[i];
+        if (!h->activo) continue;
+        int32_t fin_h = h->base + h->tamanio;
+
+        for (int m = 0; m < g_ms_count; m++) {
+            if (!g_ms_lista[m].activo) continue;
+            int32_t inicio = h->base > g_ms_lista[m].base_global
+                           ? h->base : g_ms_lista[m].base_global;
+            int32_t fin_ms = g_ms_lista[m].base_global + g_ms_lista[m].tamanio;
+            int32_t fin = fin_h < fin_ms ? fin_h : fin_ms;
+            int32_t disponible = fin - inicio;
+            if (disponible < tamanio) continue;
+
+            bool elegir = mejor_h == -1;
+            if (g_strategy == KM_STRATEGY_BEST_FIT)
+                elegir = elegir || disponible < mejor_disponible;
+            else if (g_strategy == KM_STRATEGY_WORST_FIT)
+                elegir = elegir || disponible > mejor_disponible;
+
+            if (elegir) {
+                mejor_h = i;
+                mejor_ms = m;
+                mejor_base = inicio;
+                mejor_disponible = disponible;
+            }
+            if (g_strategy == KM_STRATEGY_FIRST_FIT) break;
+        }
+        if (g_strategy == KM_STRATEGY_FIRST_FIT && mejor_h != -1) break;
+    }
+
+    if (mejor_h == -1) return false;
+
+    t_hueco original = g_huecos[mejor_h];
+    int32_t fin_reserva = mejor_base + tamanio;
+    int32_t fin_original = original.base + original.tamanio;
+    int32_t prefijo = mejor_base - original.base;
+    int32_t sufijo = fin_original - fin_reserva;
+
+    if (prefijo > 0) {
+        g_huecos[mejor_h].base = original.base;
+        g_huecos[mejor_h].tamanio = prefijo;
+        g_huecos[mejor_h].ms_id = -1;
+        if (sufijo > 0) {
+            t_hueco restante = { .activo = true, .ms_id = -1,
+                                 .base = fin_reserva, .tamanio = sufijo };
+            km_hueco_agregar(&restante);
+        }
+    } else if (sufijo > 0) {
+        g_huecos[mejor_h].base = fin_reserva;
+        g_huecos[mejor_h].tamanio = sufijo;
+        g_huecos[mejor_h].ms_id = -1;
+    } else {
+        g_huecos[mejor_h].activo = false;
+    }
+
+    *ms_id_out = mejor_ms;
+    *offset_out = mejor_base - g_ms_lista[mejor_ms].base_global;
+    return true;
 }
 
 /* SECCIÓN 2 — ASIGNACIÓN DE SEGMENTO */
@@ -410,21 +438,38 @@ bool km_asignar_segmento(int32_t pid, int32_t seg_id, int32_t tam_seg)
         return false;   /* el caller sumará huecos y decidirá si compactar */
     }
 
-    /* Asignar en un único trozo */
+    int32_t base_global = h->base;
+
+    /* El rango es contiguo globalmente; se parte sólo en los límites físicos. */
     t_segmento seg;
     memset(&seg, 0, sizeof(seg));
     seg.activo  = true;
     seg.seg_id  = seg_id;
     seg.limite  = tam_seg;
 
-    t_trozo_segmento *trozo = &seg.trozos[0];
-    trozo->ms_id         = h->ms_id;
-    trozo->dir_fisica_ms = h->base;
-    trozo->offset_seg    = 0;
-    trozo->tamanio       = tam_seg;
-    trozo->en_swap = false;
-    trozo->num_bloques_swap = 0;
-    seg.n_trozos = 1;
+    int32_t restante = tam_seg;
+    int32_t cursor = base_global;
+    while (restante > 0) {
+        int32_t ms_id, offset_ms;
+        if (!km_traducir_global_a_ms(cursor, &ms_id, &offset_ms) ||
+            seg.n_trozos >= MAX_TROZOS_POR_SEGMENTO) {
+            pthread_mutex_unlock(&mutex_huecos);
+            log_error(g_logger, "No se pudo representar rango global [%d,%d) en trozos",
+                      base_global, base_global + tam_seg);
+            return false;
+        }
+        int32_t parte = g_ms_lista[ms_id].tamanio - offset_ms;
+        if (parte > restante) parte = restante;
+        t_trozo_segmento *trozo = &seg.trozos[seg.n_trozos++];
+        trozo->ms_id = ms_id;
+        trozo->dir_fisica_ms = offset_ms;
+        trozo->offset_seg = cursor - base_global;
+        trozo->tamanio = parte;
+        trozo->en_swap = false;
+        trozo->num_bloques_swap = 0;
+        cursor += parte;
+        restante -= parte;
+    }
 
     h->base    += tam_seg;
     h->tamanio -= tam_seg;
@@ -434,8 +479,8 @@ bool km_asignar_segmento(int32_t pid, int32_t seg_id, int32_t tam_seg)
 
     km_guardar_segmento(pid, &seg);
 
-    log_info(g_logger, "## PID: %d - Segmento Creado %d - Tamaño: %d en 1 trozo(s)",
-             pid, seg_id, tam_seg);
+    log_info(g_logger, "## PID: %d - Segmento Creado %d - Tamaño: %d en %d trozo(s)",
+             pid, seg_id, tam_seg, seg.n_trozos);
 
     return true;
 }
@@ -462,8 +507,8 @@ void km_liberar_trozo(const t_trozo_segmento *trozo)
              
     t_hueco nuevo = {
         .activo  = true,
-        .ms_id   = trozo->ms_id,
-        .base    = trozo->dir_fisica_ms,
+        .ms_id   = -1,
+        .base    = km_ms_a_global(trozo->ms_id, trozo->dir_fisica_ms),
         .tamanio = trozo->tamanio
     };
  
@@ -471,7 +516,7 @@ void km_liberar_trozo(const t_trozo_segmento *trozo)
     km_hueco_agregar(&nuevo);
     pthread_mutex_unlock(&mutex_huecos);
  
-    km_mergear_huecos(trozo->ms_id);
+    km_mergear_huecos(-1);
 }
 
 
@@ -818,25 +863,15 @@ void km_compactar_global(void)
                 km_reemplazar_todos_los_trozos_de_segmento(pid, seg_id, acumulado, n_acumulado);
         }
 
-        // Reconstruir lista de huecos
+        // Reconstruir un único hueco en el espacio global contiguo
         g_huecos_count = 0;
-        int32_t acumulado_global = 0;
-        for (int m = 0; m < g_ms_count; m++) {
-            if (!g_ms_lista[m].activo) continue;
-            int32_t inicio_ms = acumulado_global;
-            int32_t fin_ms = acumulado_global + g_ms_lista[m].tamanio;
-            int32_t ocupado_en_ms = 0;
-            if (cursor_global > inicio_ms)
-                ocupado_en_ms = (cursor_global < fin_ms) ? (cursor_global - inicio_ms) : g_ms_lista[m].tamanio;
-            int32_t libre = g_ms_lista[m].tamanio - ocupado_en_ms;
-            if (libre > 0) {
-                t_hueco h = { .activo = true, .ms_id = m,
-                              .base = ocupado_en_ms, .tamanio = libre };
-                g_huecos[g_huecos_count++] = h;
-                log_info(g_logger, "COMPACT: MS=%d hueco [%d,%d) = %d bytes",
-                         m, ocupado_en_ms, ocupado_en_ms + libre, libre);
-            }
-            acumulado_global = fin_ms;
+        if (cursor_global < g_memoria_total) {
+            t_hueco h = { .activo = true, .ms_id = -1,
+                          .base = cursor_global,
+                          .tamanio = g_memoria_total - cursor_global };
+            g_huecos[g_huecos_count++] = h;
+            log_info(g_logger, "COMPACT: hueco global [%d,%d) = %d bytes",
+                     h.base, h.base + h.tamanio, h.tamanio);
         }
 
         // Assert de consistencia
@@ -1153,8 +1188,8 @@ void km_suspender_proceso(int fd_ks, int32_t pid)
         /* Liberar el espacio físico que el trozo ocupaba en el MS */
         t_hueco h = {
             .activo  = true,
-            .ms_id   = trozo->ms_id,
-            .base    = trozo->dir_fisica_ms,
+            .ms_id   = -1,
+            .base    = km_ms_a_global(trozo->ms_id, trozo->dir_fisica_ms),
             .tamanio = trozo->tamanio
         };
         pthread_mutex_lock(&mutex_huecos);
@@ -1270,8 +1305,9 @@ void km_dessuspender_proceso(int fd_ks, int32_t pid)
 
                 /* Asignar el hueco (tomar el primer hueco que alcance) */
                 pthread_mutex_lock(&mutex_huecos);
-                t_hueco *h = km_buscar_hueco(tamanio_total);
-                if (!h) {
+                int32_t nueva_dir, nuevo_ms;
+                if (!km_reservar_hueco_en_un_ms(tamanio_total,
+                                                 &nuevo_ms, &nueva_dir)) {
                     /* Inconsistencia: debería haber hueco, pero no lo hay */
                     pthread_mutex_unlock(&mutex_huecos);
                     log_error(g_logger,
@@ -1280,11 +1316,6 @@ void km_dessuspender_proceso(int fd_ks, int32_t pid)
                     ok_global = false;
                     break;
                 }
-                int32_t nueva_dir = h->base;
-                int32_t nuevo_ms  = h->ms_id;
-                h->base += tamanio_total;
-                h->tamanio -= tamanio_total;
-                if (h->tamanio == 0) h->activo = false;
                 pthread_mutex_unlock(&mutex_huecos);
 
                 /* Leer desde SWAP y escribir en el Memory Stick */
@@ -1510,6 +1541,28 @@ bool _traducir_dir(int32_t pid, int32_t dir_logica, int32_t tamanio,
     }
     return false;
 }
+
+static int32_t _bytes_contiguos_desde(int32_t pid, int32_t dir_logica,
+                                      int32_t seg_max_size)
+{
+    int32_t num_seg = dir_logica / seg_max_size;
+    int32_t despl = dir_logica % seg_max_size;
+    for (int i = 0; i < KM_MAX_PROCESOS; i++) {
+        if (!g_procesos[i].activo || g_procesos[i].pid != pid) continue;
+        for (int s = 0; s < g_procesos[i].n_segmentos; s++) {
+            t_segmento *seg = &g_procesos[i].segmentos[s];
+            if (!seg->activo || seg->seg_id != num_seg) continue;
+            for (int t = 0; t < seg->n_trozos; t++) {
+                t_trozo_segmento *trozo = &seg->trozos[t];
+                if (!trozo->en_swap &&
+                    despl >= trozo->offset_seg &&
+                    despl < trozo->offset_seg + trozo->tamanio)
+                    return trozo->offset_seg + trozo->tamanio - despl;
+            }
+        }
+    }
+    return 0;
+}
  
 /* km_leer_datos
  * Llamado por el KS (intermediario STDOUT):
@@ -1519,9 +1572,10 @@ bool _traducir_dir(int32_t pid, int32_t dir_logica, int32_t tamanio,
 void km_leer_datos(int fd_ks, int32_t pid, int32_t dir_logica, int32_t tamanio)
 {
     int seg_max = config_get_int_value(g_config, "SEGMENT_MAX_SIZE");
- 
-    int32_t ms_id, dir_fisica;
-    if (!_traducir_dir(pid, dir_logica, tamanio, &ms_id, &dir_fisica, seg_max)) {
+
+    int32_t ms_id_inicial, dir_inicial;
+    if (!_traducir_dir(pid, dir_logica, tamanio,
+                       &ms_id_inicial, &dir_inicial, seg_max)) {
         log_error(g_logger, "## PID: %d - Lectura: SEG_FAULT dir=%d tam=%d",
                   pid, dir_logica, tamanio);
         enviar_int32(fd_ks, 901 /* OP_ERROR */);
@@ -1531,23 +1585,43 @@ void km_leer_datos(int fd_ks, int32_t pid, int32_t dir_logica, int32_t tamanio)
     void *buf = malloc(tamanio);
     if (!buf) { enviar_int32(fd_ks, 901); return; }
  
-    int fd_ms = g_ms_lista[ms_id].fd;
+    int32_t procesado = 0;
+    bool ok = true;
+    while (procesado < tamanio && ok) {
+        int32_t ms_id, dir_fisica;
+        if (!_traducir_dir(pid, dir_logica + procesado, 1,
+                           &ms_id, &dir_fisica, seg_max)) {
+            ok = false;
+            break;
+        }
+        int32_t parte = _bytes_contiguos_desde(pid, dir_logica + procesado, seg_max);
+        int32_t hasta_fin_ms = g_ms_lista[ms_id].tamanio - dir_fisica;
+        if (parte > hasta_fin_ms) parte = hasta_fin_ms;
+        if (parte > tamanio - procesado) parte = tamanio - procesado;
+        if (parte <= 0) { ok = false; break; }
+        int fd_ms = g_ms_lista[ms_id].fd;
 
-    pthread_mutex_lock(&mutex_ms_ops[ms_id]);
+        pthread_mutex_lock(&mutex_ms_ops[ms_id]);
+        enviar_int32(fd_ms, OP_LEER_MS);
+        enviar_int32(fd_ms, dir_fisica);
+        enviar_int32(fd_ms, parte);
+        int32_t resp, tam_r;
+        ok = recibir_int32(fd_ms, &resp) && resp == OP_OK
+          && recibir_int32(fd_ms, &tam_r) && tam_r == parte
+          && recv(fd_ms, (char *)buf + procesado, parte, MSG_WAITALL) == parte;
+        pthread_mutex_unlock(&mutex_ms_ops[ms_id]);
+        procesado += parte;
+    }
 
-    enviar_int32(fd_ms, 700 /* OP_LEER_MS */);
-    enviar_int32(fd_ms, dir_fisica);
-    enviar_int32(fd_ms, tamanio);
- 
-    int32_t resp, tam_r;
-    recibir_int32(fd_ms, &resp);
-    recibir_int32(fd_ms, &tam_r);
-    recv(fd_ms, buf, tam_r, MSG_WAITALL);
-
-    pthread_mutex_unlock(&mutex_ms_ops[ms_id]);
+    if (!ok) {
+        free(buf);
+        enviar_int32(fd_ks, OP_ERROR);
+        return;
+    }
+    (void)ms_id_inicial;
  
     log_info(g_logger, "## PID: %d - Lectura - Dir. Física: %d - Tamaño: %d",
-             pid, dir_fisica, tamanio);
+             pid, dir_inicial, tamanio);
  
     enviar_int32(fd_ks, 900);
     enviar_int32(fd_ks, tamanio);
@@ -1564,31 +1638,46 @@ void km_escribir_datos(int fd_ks, int32_t pid, int32_t dir_logica,
                        int32_t tamanio, void *datos)
 {
     int seg_max = config_get_int_value(g_config, "SEGMENT_MAX_SIZE");
- 
-    int32_t ms_id, dir_fisica;
-    if (!_traducir_dir(pid, dir_logica, tamanio, &ms_id, &dir_fisica, seg_max)) {
+
+    int32_t ms_id_inicial, dir_inicial;
+    if (!_traducir_dir(pid, dir_logica, tamanio,
+                       &ms_id_inicial, &dir_inicial, seg_max)) {
         log_error(g_logger, "## PID: %d - Escritura: SEG_FAULT dir=%d tam=%d",
                   pid, dir_logica, tamanio);
         enviar_int32(fd_ks, 901);
         return;
     }
+    (void)ms_id_inicial;
  
-    int fd_ms = g_ms_lista[ms_id].fd;
+    int32_t procesado = 0;
+    int32_t resp = OP_OK;
+    while (procesado < tamanio && resp == OP_OK) {
+        int32_t ms_id, dir_fisica;
+        if (!_traducir_dir(pid, dir_logica + procesado, 1,
+                           &ms_id, &dir_fisica, seg_max)) {
+            resp = OP_ERROR;
+            break;
+        }
+        int32_t parte = _bytes_contiguos_desde(pid, dir_logica + procesado, seg_max);
+        int32_t hasta_fin_ms = g_ms_lista[ms_id].tamanio - dir_fisica;
+        if (parte > hasta_fin_ms) parte = hasta_fin_ms;
+        if (parte > tamanio - procesado) parte = tamanio - procesado;
+        if (parte <= 0) { resp = OP_ERROR; break; }
+        int fd_ms = g_ms_lista[ms_id].fd;
 
-    pthread_mutex_lock(&mutex_ms_ops[ms_id]);
-
-    enviar_int32(fd_ms, 701 /* OP_ESCRIBIR_MS */);
-    enviar_int32(fd_ms, dir_fisica);
-    enviar_int32(fd_ms, tamanio);
-    send(fd_ms, datos, tamanio, MSG_NOSIGNAL);
- 
-    int32_t resp;
-    recibir_int32(fd_ms, &resp);
-
-    pthread_mutex_unlock(&mutex_ms_ops[ms_id]);
+        pthread_mutex_lock(&mutex_ms_ops[ms_id]);
+        enviar_int32(fd_ms, OP_ESCRIBIR_MS);
+        enviar_int32(fd_ms, dir_fisica);
+        enviar_int32(fd_ms, parte);
+        if (send(fd_ms, (char *)datos + procesado, parte, MSG_NOSIGNAL) != parte ||
+            !recibir_int32(fd_ms, &resp))
+            resp = OP_ERROR;
+        pthread_mutex_unlock(&mutex_ms_ops[ms_id]);
+        procesado += parte;
+    }
  
     log_info(g_logger, "## PID: %d - Escritura - Dir. Física: %d - Tamaño: %d",
-             pid, dir_fisica, tamanio);
+             pid, dir_inicial, tamanio);
  
     enviar_int32(fd_ks, resp);
 }
@@ -1660,8 +1749,8 @@ void km_atender_ms_full(t_log *logger, int fd_ms)
         /* Inicializar hueco: todo el MS está libre */
         t_hueco h = {
             .activo  = true,
-            .ms_id   = idx,
-            .base    = 0,
+            .ms_id   = -1,
+            .base    = g_ms_lista[idx].base_global,
             .tamanio = tamanio
         };
         g_huecos[g_huecos_count++] = h;
@@ -1675,6 +1764,9 @@ void km_atender_ms_full(t_log *logger, int fd_ms)
  
     pthread_mutex_unlock(&mutex_huecos);
     pthread_mutex_unlock(&mutex_ms_lista);
+
+    /* Si el stick extiende el final de la memoria, se une al hueco anterior. */
+    km_mergear_huecos(-1);
  
     /* Notificar al KS */
     pthread_mutex_lock(&mutex_fd_ks);

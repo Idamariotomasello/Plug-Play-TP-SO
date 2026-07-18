@@ -85,14 +85,15 @@ typedef struct
 } t_km_hilo_arg;
 
 
-/* Hueco de memoria libre
- * t_hueco representa un bloque contiguo libre dentro de un MS. 
+/* Hueco de memoria libre.
+ * Se expresa en el espacio físico GLOBAL formado por todos los MS contiguos.
+ * ms_id se conserva por compatibilidad interna, pero no participa del fit.
  */
  
 typedef struct {
     bool    activo;          /* true = hueco válido                     */
-    int32_t ms_id;           /* índice en g_ms_lista                    */
-    int32_t base;            /* dirección física dentro del MS          */
+    int32_t ms_id;           /* -1: el hueco puede atravesar varios MS   */
+    int32_t base;            /* dirección física global                 */
     int32_t tamanio;         /* bytes disponibles                       */
 } t_hueco;
 
@@ -122,8 +123,9 @@ void km_guardar_segmento(int32_t pid, const t_segmento *seg);
 t_hueco *km_buscar_hueco(int32_t tamanio);
 void     km_liberar_trozo(const t_trozo_segmento *trozo);
 void     km_hueco_agregar(const t_hueco *h);
-void     km_mergear_huecos(int32_t ms_id);
+void     km_mergear_huecos(int32_t ms_id); /* parámetro ignorado: merge global */
 bool km_traducir_global_a_ms(int32_t dir_global, int32_t *ms_id_out, int32_t *offset_out);
+int32_t km_ms_a_global(int32_t ms_id, int32_t offset_local);
  
 /* Prototipos — SWAP */
 int32_t km_swap_reservar_bloque(void);
