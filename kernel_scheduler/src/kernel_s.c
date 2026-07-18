@@ -235,6 +235,126 @@ t_mutex *ks_buscar_mutex(const char *nombre)
     return NULL;
 }
 
+/* Reubica un PCB READY entre colas CMN sin alterar el semáforo: sigue
+ * representando exactamente un proceso disponible. */
+static bool ks_reubicar_ready_cmn(t_pcb *pcb, int32_t prioridad_anterior,
+                                  int32_t prioridad_nueva)
+{
+    if (!ks_prioridad_valida_cmn(prioridad_anterior) ||
+        !ks_prioridad_valida_cmn(prioridad_nueva))
+        return false;
+
+    pthread_mutex_lock(&g_mutex_cola_ready);
+
+    t_cola_ready_local *origen = &g_cmn_colas[prioridad_anterior];
+    t_nodo_ready *anterior = NULL;
+    t_nodo_ready *actual = origen->head;
+    while (actual && actual->pcb != pcb) {
+        anterior = actual;
+        actual = actual->siguiente;
+    }
+
+    if (!actual) {
+        pthread_mutex_unlock(&g_mutex_cola_ready);
+        return false;
+    }
+
+    if (anterior) anterior->siguiente = actual->siguiente;
+    else origen->head = actual->siguiente;
+    if (origen->tail == actual) origen->tail = anterior;
+
+    actual->siguiente = NULL;
+    t_cola_ready_local *destino = &g_cmn_colas[prioridad_nueva];
+    if (!destino->tail)
+        destino->head = destino->tail = actual;
+    else {
+        destino->tail->siguiente = actual;
+        destino->tail = actual;
+    }
+
+    pthread_mutex_unlock(&g_mutex_cola_ready);
+    return true;
+}
+
+/* Debe invocarse con g_mutex_tabla_mutex tomado. */
+static void ks_aplicar_prioridad_efectiva(t_pcb *pcb, int32_t nueva_prioridad)
+{
+    if (!pcb || pcb->prioridad == nueva_prioridad) return;
+
+    int32_t anterior = pcb->prioridad;
+    bool estaba_ready = pcb->estado == ESTADO_READY;
+    pcb->prioridad = nueva_prioridad;
+
+    if (g_algoritmo == ALGO_CMN && estaba_ready) {
+        bool movido = ks_reubicar_ready_cmn(pcb, anterior, nueva_prioridad);
+        log_info(logger,
+                 "## (%d) - Prioridad efectiva %d -> %d; READY %s a cola %d",
+                 pcb->pid, anterior, nueva_prioridad,
+                 movido ? "reubicado" : "no encontrado para reubicar",
+                 nueva_prioridad);
+        if (movido && nueva_prioridad < anterior)
+            ks_evaluar_desalojo_cmn(pcb);
+    } else {
+        log_info(logger, "## (%d) - Prioridad efectiva %d -> %d (estado=%s)",
+                 pcb->pid, anterior, nueva_prioridad,
+                 ks_nombre_estado(pcb->estado));
+    }
+}
+
+/* Propaga una prioridad heredada por una cadena de procesos que esperan otros
+ * mutexes. Debe invocarse con g_mutex_tabla_mutex tomado. */
+static void ks_heredar_prioridad(t_pcb *pcb, int32_t prioridad, int profundidad)
+{
+    if (!pcb || profundidad >= KS_MAX_PROCESOS ||
+        prioridad >= pcb->prioridad)
+        return;
+
+    ks_aplicar_prioridad_efectiva(pcb, prioridad);
+
+    if (!pcb->mutex_esperado) return;
+    t_mutex *esperado = ks_buscar_mutex(pcb->mutex_esperado);
+    if (!esperado || esperado->pid_duenio < 0 ||
+        esperado->pid_duenio == pcb->pid)
+        return;
+
+    ks_heredar_prioridad(ks_buscar_pcb(esperado->pid_duenio),
+                         prioridad, profundidad + 1);
+}
+
+/* Recalcula la prioridad efectiva a partir de la prioridad base y de todos los
+ * procesos que esperan mutexes poseídos por el PCB. La recursión permite
+ * propagar tanto aumentos como restauraciones por una cadena de espera. */
+static void ks_recalcular_prioridad_interna(t_pcb *pcb, int profundidad)
+{
+    if (!pcb || g_algoritmo != ALGO_CMN ||
+        profundidad >= KS_MAX_PROCESOS)
+        return;
+
+    int32_t efectiva = pcb->prioridad_original;
+    for (int i = 0; i < KS_MAX_MUTEX; i++) {
+        t_mutex *m = &g_mutexes[i];
+        if (!m->activo || !m->tomado || m->pid_duenio != pcb->pid) continue;
+        for (t_proceso_esperando *e = m->cola_espera; e; e = e->siguiente)
+            if (e->pcb && e->pcb->prioridad < efectiva)
+                efectiva = e->pcb->prioridad;
+    }
+
+    ks_aplicar_prioridad_efectiva(pcb, efectiva);
+
+    if (pcb->mutex_esperado) {
+        t_mutex *esperado = ks_buscar_mutex(pcb->mutex_esperado);
+        if (esperado && esperado->pid_duenio >= 0 &&
+            esperado->pid_duenio != pcb->pid)
+            ks_recalcular_prioridad_interna(
+                ks_buscar_pcb(esperado->pid_duenio), profundidad + 1);
+    }
+}
+
+static void ks_recalcular_prioridad(t_pcb *pcb)
+{
+    ks_recalcular_prioridad_interna(pcb, 0);
+}
+
 void ks_syscall_mutex_create(t_pcb *pcb, const char *nombre)
 {
     pthread_mutex_lock(&g_mutex_tabla_mutex);
@@ -289,6 +409,8 @@ void ks_syscall_mutex_lock(t_pcb *pcb, const char *nombre)
         m->tomado    = true;
         m->pid_duenio = pcb->pid;
         m->prioridad_original_duenio = pcb->prioridad;
+        free(pcb->mutex_esperado);
+        pcb->mutex_esperado = NULL;
 
         log_info(logger,
                  "## (%d) - MUTEX_LOCK: '%s' tomado (estaba libre)",
@@ -317,6 +439,9 @@ void ks_syscall_mutex_lock(t_pcb *pcb, const char *nombre)
             cur->siguiente = nodo;
         }
 
+        free(pcb->mutex_esperado);
+        pcb->mutex_esperado = strdup(nombre);
+
         // Herencia de prioridades (solo aplica en CMN)
         if (g_algoritmo == ALGO_CMN) {
             t_pcb *duenio = ks_buscar_pcb(m->pid_duenio);
@@ -328,7 +453,7 @@ void ks_syscall_mutex_lock(t_pcb *pcb, const char *nombre)
                          duenio->pid,
                          pcb->prioridad,
                          duenio->prioridad);
-                duenio->prioridad = pcb->prioridad;
+                ks_heredar_prioridad(duenio, pcb->prioridad, 0);
             }
         }
 
@@ -361,14 +486,7 @@ void ks_syscall_mutex_unlock(t_pcb *pcb, const char *nombre)
         return;
     }
 
-    // Restaurar prioridad original si hubo herencia
-    if (g_algoritmo == ALGO_CMN &&
-        pcb->prioridad != m->prioridad_original_duenio) {
-        log_info(logger,
-                 "## (%d) - MUTEX_UNLOCK: restaurando prioridad original %d (tenía %d por herencia)",
-                 pcb->pid, m->prioridad_original_duenio, pcb->prioridad);
-        pcb->prioridad = m->prioridad_original_duenio;
-    }
+    t_pcb *siguiente = NULL;
 
     // ¿Hay procesos esperando?
     if (m->cola_espera) {
@@ -376,21 +494,18 @@ void ks_syscall_mutex_unlock(t_pcb *pcb, const char *nombre)
         t_proceso_esperando *nodo = m->cola_espera;
         m->cola_espera            = nodo->siguiente;
 
-        t_pcb *siguiente = nodo->pcb;
+        siguiente = nodo->pcb;
         free(nodo);
 
         m->pid_duenio = siguiente->pid;
         m->prioridad_original_duenio = siguiente->prioridad;
+        free(siguiente->mutex_esperado);
+        siguiente->mutex_esperado = NULL;
         // m->tomado sigue en true — lo toma el siguiente
 
         log_info(logger,
                  "## (%d) - MUTEX_UNLOCK: '%s' cedido a PID %d",
                  pcb->pid, nombre, siguiente->pid);
-
-        pthread_mutex_unlock(&g_mutex_tabla_mutex);
-
-        // Desbloquear al siguiente
-        ks_encolar_ready(siguiente);
 
     } else {
         // Nadie esperaba — liberar
@@ -401,8 +516,17 @@ void ks_syscall_mutex_unlock(t_pcb *pcb, const char *nombre)
                  "## (%d) - MUTEX_UNLOCK: '%s' liberado (nadie esperaba)",
                  pcb->pid, nombre);
 
-        pthread_mutex_unlock(&g_mutex_tabla_mutex);
     }
+
+    /* Puede conservar otros mutexes con procesos esperando: no siempre debe
+     * volver directamente a su prioridad base. */
+    if (siguiente)
+        ks_recalcular_prioridad(siguiente);
+    ks_recalcular_prioridad(pcb);
+    pthread_mutex_unlock(&g_mutex_tabla_mutex);
+
+    if (siguiente)
+        ks_encolar_ready(siguiente);
 
     // El proceso que hizo unlock vuelve a READY
     ks_encolar_ready(pcb);
@@ -492,6 +616,7 @@ t_pcb *ks_crear_pcb(int32_t pid, int32_t prioridad)
             memset(&g_ks_pcbs[i], 0, sizeof(t_pcb));
             g_ks_pcbs[i].pid       = pid;
             g_ks_pcbs[i].prioridad = prioridad;
+            g_ks_pcbs[i].prioridad_original = prioridad;
             g_ks_pcbs[i].estado    = ESTADO_NEW;
             g_ks_pcbs[i].activo    = true;
             pcb = &g_ks_pcbs[i];
@@ -1505,6 +1630,7 @@ void *ks_hilo_quantum(void *varg)
                 if (g_cpus[i].fd_dispatch == arg->fd_cpu &&
                     g_cpus[i].dispatch_id == arg->dispatch_id &&
                     g_cpus[i].pcb_actual == arg->pcb &&
+                    ks_algoritmo_efectivo_pcb(arg->pcb) == ALGO_RR &&
                     !g_cpus[i].interrupcion_pendiente) {
                     g_cpus[i].interrupcion_pendiente = true;
                     puede_interrumpir = true;

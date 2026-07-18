@@ -33,6 +33,7 @@ typedef struct {
 int fd_kernel_memory;
 
 t_pcb *ks_buscar_pcb(int32_t pid);
+const char *ks_nombre_estado(e_estado_proceso estado);
 void   ks_cambiar_estado(t_pcb *pcb, e_estado_proceso nuevo);
 void   ks_encolar_ready(t_pcb *pcb);
 t_mutex *ks_buscar_mutex(const char *nombre);
