@@ -47,7 +47,7 @@ void km_init_procesos(void)
     memset(g_procesos, 0, sizeof(g_procesos));
     g_procesos_init = true;
 }
- 
+
 bool km_cargar_instrucciones(int32_t pid, const char *path)
 {
     km_init_procesos();
