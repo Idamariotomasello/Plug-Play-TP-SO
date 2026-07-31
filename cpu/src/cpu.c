@@ -125,6 +125,35 @@ static t_segmento *cpu_buscar_segmento(t_contexto *ctx, int32_t num_seg)
     return NULL;
 }
 
+static bool cpu_resolver_direccion_fisica(t_contexto *ctx, uint32_t dir_logica,
+                                          int32_t tamanio, int32_t *dir_fisica_out)
+{
+    int32_t num_seg = 0;
+    int32_t despl = 0;
+    cpu_mmu_traducir(dir_logica, &num_seg, &despl);
+
+    t_segmento *seg = cpu_buscar_segmento(ctx, num_seg);
+    if (!seg)
+        return false;
+
+    if (despl + tamanio > seg->limite)
+        return false;
+
+    for (int i = 0; i < seg->n_trozos; i++) {
+        t_trozo_segmento *t = &seg->trozos[i];
+        int32_t trozo_inicio = t->offset_seg;
+        int32_t trozo_fin = t->offset_seg + t->tamanio;
+
+        if (despl < trozo_inicio || despl >= trozo_fin)
+            continue;
+
+        *dir_fisica_out = t->dir_fisica_ms + (despl - trozo_inicio);
+        return true;
+    }
+
+    return false;
+}
+
 bool cpu_leer_memoria(t_contexto *ctx, uint32_t dir_logica,
                       int32_t tamanio, void *dest)
 {
@@ -431,6 +460,7 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
     else if (!strcmp(op, "MOV_IN")) {
     uint32_t buf = 0;
     size_t tam_reg = cpu_tam_registro(a1);
+    int32_t dir_fisica = -1;
     if (tam_reg == 0) {
         *motivo = MOTIVO_ERROR;
         return false;
@@ -438,8 +468,12 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
 
     int32_t seg, despl;
     cpu_mmu_traducir(ctx->regs.SI, &seg, &despl);
-    log_info(logger, "## PID: %d - MOV_IN: SI=%u → MMU: seg=%d, despl=%d → dir_fisica=%d",
-             ctx->pid, ctx->regs.SI, seg, despl, despl);
+    if (cpu_resolver_direccion_fisica(ctx, ctx->regs.SI, (int32_t)tam_reg, &dir_fisica))
+        log_info(logger, "## PID: %d - MOV_IN: SI=%u -> MMU: seg=%d, despl=%d -> dir_fisica=%d",
+                 ctx->pid, ctx->regs.SI, seg, despl, dir_fisica);
+    else
+        log_info(logger, "## PID: %d - MOV_IN: SI=%u -> MMU: seg=%d, despl=%d",
+                 ctx->pid, ctx->regs.SI, seg, despl);
 
     if (!modo_test_sin_memoria) {
         if (!cpu_leer_memoria(ctx, ctx->regs.SI, (int32_t)tam_reg, &buf)) {
@@ -449,10 +483,14 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
     }
     cpu_escribir_registro(&ctx->regs, a1, buf);
     log_info(logger, "## PID: %d - MOV_IN: leído valor=%u → guardado en %s", ctx->pid, buf, a1);
+    if (dir_fisica >= 0)
+        log_info(logger, "## PID: %d - Accion: LEER - Direccion Fisica: %d - Valor: %u",
+                 ctx->pid, dir_fisica, buf);
     }
     else if (!strcmp(op, "MOV_OUT")) {
         uint32_t val = cpu_leer_registro(&ctx->regs, a1);
         size_t tam_reg = cpu_tam_registro(a1);
+        int32_t dir_fisica = -1;
         if (tam_reg == 0) {
             *motivo = MOTIVO_ERROR;
             return false;
@@ -460,8 +498,12 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
 
         int32_t seg, despl;
         cpu_mmu_traducir(ctx->regs.DI, &seg, &despl);
-        log_info(logger, "## PID: %d - MOV_OUT: DI=%u → MMU: seg=%d, despl=%d → dir_fisica=%d, valor=%u",
-                ctx->pid, ctx->regs.DI, seg, despl, despl, val);
+        if (cpu_resolver_direccion_fisica(ctx, ctx->regs.DI, (int32_t)tam_reg, &dir_fisica))
+            log_info(logger, "## PID: %d - MOV_OUT: DI=%u -> MMU: seg=%d, despl=%d -> dir_fisica=%d, valor=%u",
+                    ctx->pid, ctx->regs.DI, seg, despl, dir_fisica, val);
+        else
+            log_info(logger, "## PID: %d - MOV_OUT: DI=%u -> MMU: seg=%d, despl=%d, valor=%u",
+                    ctx->pid, ctx->regs.DI, seg, despl, val);
 
         if (!modo_test_sin_memoria) {
             if (!cpu_escribir_memoria(ctx, ctx->regs.DI, (int32_t)tam_reg, &val)) {
@@ -469,6 +511,9 @@ bool cpu_execute(t_contexto *ctx, const char *linea,
                 return false;
             }
         }
+        if (dir_fisica >= 0)
+            log_info(logger, "## PID: %d - Accion: ESCRIBIR - Direccion Fisica: %d - Valor: %u",
+                    ctx->pid, dir_fisica, val);
 
     }
     else if (!strcmp(op, "COPY_MEM")) {
