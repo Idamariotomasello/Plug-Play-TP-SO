@@ -1,92 +1,96 @@
-# tp-scaffold
+# Plug & Pray 
 
-Esta es una plantilla de proyecto diseñada para generar un TP de Sistemas
-Operativos de la UTN FRBA.
+### Sistema Operativo Distribuido — Sistemas Operativos | 2026
 
-## Dependencias
+Trabajo práctico cuatrimestral desarrollado en equipo para la materia **Sistemas Operativos**, cuyo objetivo fue implementar una simulación distribuida de un sistema operativo utilizando diferentes módulos independientes desarrollados en **C** y comunicados mediante sockets.
 
-Para poder compilar y ejecutar el proyecto, es necesario tener instalada la
-biblioteca [so-commons-library] de la cátedra:
+## 🧩 Mi participación — Módulo CPU
 
-```bash
-git clone https://github.com/sisoputnfrba/so-commons-library
-cd so-commons-library
-make debug
-make install
+Mi principal responsabilidad dentro del proyecto fue el desarrollo del **módulo CPU**, encargado de simular el funcionamiento de un procesador y ejecutar las instrucciones de los procesos.
+
+La CPU implementa un ciclo de instrucción simplificado:
+
+```text
+FETCH → DECODE → EXECUTE → CHECK INTERRUPT
 ```
 
-## Compilación y ejecución
+### Principales funcionalidades desarrolladas
 
-Cada módulo del proyecto se compila de forma independiente a través de un
-archivo `makefile`. Para compilar un módulo, es necesario ejecutar el comando
-`make` desde la carpeta correspondiente.
+* Implementación del **ciclo de instrucción**.
+* Manejo del **Program Counter (PC)** y registros de CPU.
+* Fetch de instrucciones desde **Kernel Memory**.
+* Decodificación e interpretación de instrucciones.
+* Ejecución de operaciones aritméticas y de control:
 
-El ejecutable resultante de la compilación se guardará en la carpeta `bin` del
-módulo. Ejemplo:
+  * `SET`
+  * `SUM`
+  * `SUB`
+  * `JNZ`
+  * `NOOP`
+* Implementación de operaciones de acceso a memoria:
 
-```sh
-cd kernel
-make
-./bin/kernel
-```
+  * `MOV_IN`
+  * `MOV_OUT`
+  * `COPY_MEM`
+* Implementación y comunicación de **Syscalls**:
 
-## Importar desde Visual Studio Code
+  * `MUTEX_CREATE`
+  * `MUTEX_LOCK`
+  * `MUTEX_UNLOCK`
+  * `MEM_ALLOC`
+  * `MEM_FREE`
+  * `SLEEP`
+  * `STDIN`
+  * `STDOUT`
+  * `INIT_PROC`
+  * `EXIT`
+* Manejo de **interrupciones** provenientes del Kernel Scheduler.
+* Actualización y recuperación del contexto de ejecución.
+* Implementación de una **MMU simulada** para traducir direcciones lógicas a físicas utilizando segmentación.
+* Validación de límites de segmentos y detección de **Segmentation Fault**.
+* Comunicación con **Kernel Scheduler, Kernel Memory y Memory Stick** mediante sockets.
 
-Para importar el workspace, debemos abrir el archivo `tp.code-workspace` desde
-la interfaz o ejecutando el siguiente comando desde la carpeta raíz del
-repositorio:
+La CPU debía mantener registros como `PC`, `AX`, `BX`, `CX`, `DX`, `EAX`, `EBX`, `ECX`, `EDX`, `SI` y `DI`, y utilizar `SI` y `DI` para operaciones relacionadas con direcciones lógicas de memoria.
 
-```bash
-code tp.code-workspace
-```
+La traducción de memoria se realizó bajo un esquema de **segmentación**, separando número de segmento y desplazamiento para obtener la dirección física correspondiente.
 
-## Checkpoint
+## 🛠️ Tecnologías y conceptos
 
-Para cada checkpoint de control obligatorio, se debe crear un tag en el
-repositorio con el siguiente formato:
+* **C**
+* Linux
+* POSIX
+* Sockets TCP
+* Threads
+* Concurrencia
+* Inter-Process Communication
+* Gestión de memoria
+* Segmentación
+* MMU
+* CPU / Instruction Cycle
+* Git
+* Make / Makefiles
+* Logging
 
-```
-checkpoint-{número}
-```
+## 🎯 Qué aprendí
 
-Donde `{número}` es el número del checkpoint, ejemplo: `checkpoint-1`.
+El desarrollo del módulo CPU me permitió llevar a código conceptos de **Arquitectura de Computadores y Sistemas Operativos**, especialmente:
 
-Para crear un tag y subirlo al repositorio, podemos utilizar los siguientes
-comandos:
+* Ciclo de instrucción.
+* Registros y Program Counter.
+* Interrupciones.
+* Syscalls.
+* Comunicación entre procesos.
+* Traducción de direcciones lógicas a físicas.
+* Segmentación de memoria.
+* Programación concurrente.
+* Integración de componentes dentro de un sistema distribuido.
 
-```bash
-git tag -a checkpoint-{número} -m "Checkpoint {número}"
-git push origin checkpoint-{número}
-```
+## 👥 Proyecto grupal
 
-> [!WARNING]
-> Asegúrense de que el código compila y cumple con los requisitos del checkpoint
-> antes de subir el tag.
+El proyecto fue desarrollado en equipo e integrado junto con los módulos:
 
-## Entrega
+**Kernel Scheduler · Kernel Memory · Memory Stick · SWAP · I/O · CPU**
 
-Para desplegar el proyecto en una máquina Ubuntu Server, podemos utilizar el
-script [so-deploy] de la cátedra:
+El trabajo fue desarrollado de manera iterativa e incremental hasta lograr la integración de todos los componentes.
 
-```bash
-git clone https://github.com/sisoputnfrba/so-deploy.git
-cd so-deploy
-./deploy.sh -r=release -p=utils -p=kernel_scheduler -p=kernel_memory -p=cpu -p=memory_stick -p=swap -p=io "tp-{año}-{cuatri}-{grupo}"
-```
-
-El mismo se encargará de instalar las Commons, clonar el repositorio del grupo
-y compilar el proyecto en la máquina remota.
-
-> [!NOTE]
-> Ante cualquier duda, pueden consultar la documentación en el repositorio de
-> [so-deploy], o utilizar el comando `./deploy.sh --help`.
-
-## Guías útiles
-
-- [Cómo interpretar errores de compilación](https://docs.utnso.com.ar/primeros-pasos/primer-proyecto-c#errores-de-compilacion)
-- [Cómo utilizar el debugger](https://docs.utnso.com.ar/guias/herramientas/debugger)
-- [Cómo configuramos Visual Studio Code](https://docs.utnso.com.ar/guias/herramientas/code)
-- **[Guía de despliegue de TP](https://docs.utnso.com.ar/guías/herramientas/deploy)**
-
-[so-commons-library]: https://github.com/sisoputnfrba/so-commons-library
-[so-deploy]: https://github.com/sisoputnfrba/so-deploy
+> **Nota:** Este repositorio corresponde a una copia personal del trabajo práctico grupal, conservada con fines de portfolio y referencia profesional, con autorización de la cátedra.
